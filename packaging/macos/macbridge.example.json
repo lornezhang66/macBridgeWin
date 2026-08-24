@@ -1,0 +1,11 @@
+{
+  "host": "192.168.1.100",
+  "port": 24800,
+  "token": "replace-with-the-same-long-random-token",
+  "pcSide": "top",
+  "edgeThreshold": 2,
+  "crossingThreshold": 10,
+  "returnThreshold": 10,
+  "sensitivity": 1.0,
+  "scrollScale": 1.0
+}

@@ -2,6 +2,20 @@
 
 Dependency-free keyboard/mouse sharing for the topology **Windows above Mac**. Pushing upward past the Mac top edge transfers control; pushing downward past the Windows virtual-desktop bottom edge returns it.
 
+## Install test builds
+
+Download both installers from [GitHub Releases](https://github.com/lornezhang66/macBridgeWin/releases):
+
+- Windows: install `WinBridge-*-windows-x64.msi`, edit `%LocalAppData%\Programs\WinBridge\winbridge.json`, then start WinBridge from the Start menu.
+- macOS: install `MacBridge-*-macOS-universal.pkg`, copy and edit the config, then run the client:
+  ```sh
+  cp /usr/local/share/macbridge/macbridge.example.json ~/macbridge.json
+  open -e ~/macbridge.json
+  cd ~ && /usr/local/bin/macbridge
+  ```
+
+Use the Windows machine's LAN IP and the same long random token in both files. The macOS package is unsigned; use **Control-click → Open** if Gatekeeper warns. Grant macbridge Accessibility access when prompted.
+
 ## Build and test
 
 macOS 13+ with Xcode command-line tools:

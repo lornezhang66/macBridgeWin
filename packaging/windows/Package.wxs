@@ -1,0 +1,33 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="WinBridge" Manufacturer="MacBridge" Version="$(var.Version)"
+           UpgradeCode="7B20C979-A97C-47B7-A719-460B93DCD6C8" Scope="perUser">
+    <MajorUpgrade DowngradeErrorMessage="A newer WinBridge version is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="WinBridge">
+          <Component Id="WinBridgeExecutable" Guid="*">
+            <File Id="WinBridgeExe" Source="$(var.Payload)\winbridge.exe" KeyPath="yes">
+              <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder"
+                        Name="WinBridge" WorkingDirectory="INSTALLFOLDER" Advertise="no" />
+            </File>
+          </Component>
+          <Component Id="WinBridgeConfig" Guid="*" NeverOverwrite="yes">
+            <File Id="WinBridgeConfigFile" Source="$(var.Payload)\winbridge.json" KeyPath="yes" />
+          </Component>
+          <Component Id="WinBridgeReadme" Guid="*">
+            <File Id="WinBridgeReadmeFile" Source="$(var.Payload)\README.txt" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <Feature Id="MainFeature" Title="WinBridge">
+      <ComponentRef Id="WinBridgeExecutable" />
+      <ComponentRef Id="WinBridgeConfig" />
+      <ComponentRef Id="WinBridgeReadme" />
+    </Feature>
+  </Package>
+</Wix>

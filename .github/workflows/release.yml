@@ -1,0 +1,90 @@
+name: Release installers
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version used for a validation build
+        default: 0.1.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal binary
+        run: swift build -c release --arch arm64 --arch x86_64
+      - name: Build pkg
+        shell: bash
+        run: |
+          version="${RELEASE_VERSION#v}"
+          bin_path="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/macbridge"
+          mkdir -p pkgroot/usr/local/bin pkgroot/usr/local/share/macbridge dist
+          cp "$bin_path" pkgroot/usr/local/bin/macbridge
+          cp packaging/macos/macbridge.example.json pkgroot/usr/local/share/macbridge/
+          cp README.md pkgroot/usr/local/share/macbridge/
+          pkgbuild --root pkgroot --install-location / \
+            --identifier com.macbridge.client --version "$version" \
+            "dist/MacBridge-${version}-macOS-universal.pkg"
+        env:
+          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: dist/*.pkg
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Publish WinBridge
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_VERSION.TrimStart('v')
+          dotnet publish windows/WinBridge.csproj -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=true -p:DebugType=None -p:Version=$version -o payload
+          Copy-Item packaging/windows/winbridge.json payload/
+          Copy-Item packaging/windows/README.txt payload/
+        env:
+          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_VERSION.TrimStart('v')
+          dotnet tool install --global wix
+          New-Item -ItemType Directory -Force dist | Out-Null
+          wix build packaging/windows/Package.wxs -arch x64 `
+            -d "Version=$version" -d "Payload=$((Resolve-Path payload).Path)" `
+            -o "dist/WinBridge-$version-windows-x64.msi"
+        env:
+          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/*.msi
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-installer'
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --generate-notes --title "MacBridge $GITHUB_REF_NAME"
