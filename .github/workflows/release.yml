@@ -60,6 +60,11 @@ jobs:
             -p:PublishSingleFile=true -p:DebugType=None -p:Version=$version -o payload
           Copy-Item packaging/windows/winbridge.json payload/
           Copy-Item packaging/windows/README.txt payload/
+          $process = Start-Process "$pwd/payload/winbridge.exe" -PassThru
+          Start-Sleep -Seconds 3
+          if ($process.HasExited) { throw "WinBridge tray process exited during smoke test" }
+          Stop-Process -Id $process.Id -Force
+          Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force
         env:
           RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
       - name: Build MSI
