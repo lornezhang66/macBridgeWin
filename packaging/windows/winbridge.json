@@ -1,0 +1,7 @@
+{
+  "listenHost": "0.0.0.0",
+  "port": 24800,
+  "token": "change-me",
+  "edgeThreshold": 2,
+  "returnThreshold": 10
+}
