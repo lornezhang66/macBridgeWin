@@ -1,0 +1,6 @@
+.build/
+.DS_Store
+macbridge.json
+winbridge.json
+bin/
+obj/
