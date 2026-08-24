@@ -138,10 +138,10 @@ internal sealed record BridgeConfig
 
     public void Validate()
     {
-        if (!IPAddress.TryParse(ListenHost, out _)) throw new InvalidDataException("listenHost must be an IP address");
-        if (Port is < 1 or > 65535) throw new InvalidDataException("port must be 1...65535");
-        if (string.IsNullOrEmpty(Token) || Token == "change-me") throw new InvalidDataException("set a non-default token");
-        if (EdgeThreshold < 0 || ReturnThreshold <= 0) throw new InvalidDataException("thresholds must be positive");
+        if (!IPAddress.TryParse(ListenHost, out _)) throw new InvalidDataException("listenHost 必须是 IP 地址");
+        if (Port is < 1 or > 65535) throw new InvalidDataException("port 必须在 1 到 65535 之间");
+        if (string.IsNullOrEmpty(Token) || Token == "change-me") throw new InvalidDataException("请设置非默认 token");
+        if (EdgeThreshold < 0 || ReturnThreshold <= 0) throw new InvalidDataException("阈值必须为正数");
     }
 }
 

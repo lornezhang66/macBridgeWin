@@ -26,14 +26,14 @@ public struct MacConfig: Codable, Equatable {
     }
 
     public func validate() throws {
-        guard !host.isEmpty else { throw ConfigError.invalid("host must not be empty") }
-        guard (1...65535).contains(port) else { throw ConfigError.invalid("port must be 1...65535") }
-        guard !token.isEmpty && token != "change-me" else { throw ConfigError.invalid("set a non-default token") }
-        guard pcSide == "top" else { throw ConfigError.invalid("pcSide must be top") }
+        guard !host.isEmpty else { throw ConfigError.invalid("host 不能为空") }
+        guard (1...65535).contains(port) else { throw ConfigError.invalid("port 必须在 1 到 65535 之间") }
+        guard !token.isEmpty && token != "change-me" else { throw ConfigError.invalid("请设置非默认 token") }
+        guard pcSide == "top" else { throw ConfigError.invalid("pcSide 必须为 top") }
         let numbers = [edgeThreshold, crossingThreshold, returnThreshold, sensitivity, scrollScale]
         guard numbers.allSatisfy(\.isFinite), edgeThreshold >= 0, crossingThreshold > 0,
               returnThreshold > 0, sensitivity > 0, scrollScale > 0 else {
-            throw ConfigError.invalid("thresholds and scales must be finite and positive")
+            throw ConfigError.invalid("阈值和倍率必须是有效的正数")
         }
     }
 

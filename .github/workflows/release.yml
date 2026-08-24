@@ -98,4 +98,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" --generate-notes --title "MacBridge $GITHUB_REF_NAME"
+            --repo "$GITHUB_REPOSITORY" --title "MacBridge $GITHUB_REF_NAME" \
+            --notes "请分别下载并安装 macOS 的 .pkg 和 Windows x64 的 .msi。安装及配置步骤请查看仓库首页的中文使用说明。"

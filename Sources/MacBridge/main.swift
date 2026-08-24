@@ -22,7 +22,7 @@ final class SocketClient {
         let status = getaddrinfo(host, String(port), &hints, &addresses)
         guard status == 0, let first = addresses else {
             throw NSError(domain: "MacBridge", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "cannot resolve \(host): \(String(cString: gai_strerror(status)))"])
+                          userInfo: [NSLocalizedDescriptionKey: "无法解析主机 \(host)：\(String(cString: gai_strerror(status)))"])
         }
         defer { freeaddrinfo(addresses) }
 
@@ -42,7 +42,7 @@ final class SocketClient {
         }
         guard fd >= 0 else {
             throw NSError(domain: "MacBridge", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "cannot connect to \(host):\(port)"])
+                          userInfo: [NSLocalizedDescriptionKey: "无法连接到 \(host):\(port)"])
         }
 
         guard send(WireMessage(type: "auth", token: token)),
@@ -51,7 +51,7 @@ final class SocketClient {
               reply.type == "auth_ok" else {
             close()
             throw NSError(domain: "MacBridge", code: 3,
-                          userInfo: [NSLocalizedDescriptionKey: "authentication failed"])
+                          userInfo: [NSLocalizedDescriptionKey: "认证失败，请检查两端 token"])
         }
     }
 
@@ -62,7 +62,7 @@ final class SocketClient {
                 guard let message = try? JSONDecoder().decode(WireMessage.self, from: data) else { continue }
                 self.onMessage?(message)
             }
-            self.finish(reason: "Windows connection closed")
+            self.finish(reason: "Windows 连接已关闭")
         }
     }
 
@@ -154,7 +154,7 @@ final class BridgeController {
                                                callback: eventTapCallback,
                                                userInfo: Unmanaged.passUnretained(self).toOpaque()) else {
             throw NSError(domain: "MacBridge", code: 4,
-                          userInfo: [NSLocalizedDescriptionKey: "cannot create event tap; grant Accessibility permission"])
+                          userInfo: [NSLocalizedDescriptionKey: "无法捕获输入，请授予辅助功能权限"])
         }
         tap = created
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, created, 0)
@@ -239,7 +239,7 @@ final class BridgeController {
         CGDisplayHideCursor(screen.id)
         cursorHidden = true
         if !client.send(WireMessage(type: "enter_pc", xRatio: ratio)) {
-            connectionLost("send failed")
+            connectionLost("发送失败")
         }
     }
 
@@ -266,7 +266,7 @@ final class BridgeController {
     }
 
     private func send(_ message: WireMessage) {
-        if !client.send(message) { connectionLost("send failed") }
+        if !client.send(message) { connectionLost("发送失败") }
     }
 
     private func display(at point: CGPoint) -> (id: CGDirectDisplayID, bounds: CGRect) {
