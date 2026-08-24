@@ -37,8 +37,10 @@ internal sealed class TrayContext : ApplicationContext
     private readonly string _configPath;
     private readonly NotifyIcon _icon;
     private readonly ToolStripMenuItem _status = new("正在启动…") { Enabled = false };
+    private readonly ToolStripMenuItem _restart = new("重新启动服务");
     private CancellationTokenSource? _serverStop;
     private Task? _serverTask;
+    private bool _restarting;
     private bool _firstStart = true;
 
     public TrayContext(string configPath)
@@ -47,7 +49,8 @@ internal sealed class TrayContext : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Items.Add(_status);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("重新启动服务", null, (_, _) => StartServer());
+        _restart.Click += (_, _) => StartServer();
+        menu.Items.Add(_restart);
         menu.Items.Add("编辑配置…", null, (_, _) => OpenConfig());
         menu.Items.Add("打开安装目录…", null, (_, _) => OpenInstallFolder());
         menu.Items.Add(new ToolStripSeparator());
@@ -74,26 +77,32 @@ internal sealed class TrayContext : ApplicationContext
 
     private async void StartServer()
     {
-        _serverStop?.Cancel();
-        if (_serverTask is not null)
+        if (_restarting) return;
+        _restarting = true;
+        _restart.Enabled = false;
+        var oldStop = _serverStop;
+        var oldTask = _serverTask;
+        _serverStop = null;
+        _serverTask = null;
+        oldStop?.Cancel();
+        if (oldTask is not null)
         {
-            try { await _serverTask; }
-            catch (OperationCanceledException) { }
+            try { await oldTask; }
             catch { }
         }
-        _serverStop?.Dispose();
-        _serverStop = new CancellationTokenSource();
+        oldStop?.Dispose();
 
         try
         {
             var config = JsonSerializer.Deserialize<BridgeConfig>(await File.ReadAllTextAsync(_configPath), Json.Options)
                          ?? throw new InvalidDataException("配置为空");
             config.Validate();
-            SetStatus($"正在监听 {config.ListenHost}:{config.Port}");
-            _serverTask = new BridgeServer(config, SetStatus).RunAsync(_serverStop.Token);
-            await _serverTask;
+            var stop = new CancellationTokenSource();
+            var task = Task.Run(() => new BridgeServer(config, SetStatus).RunAsync(stop.Token));
+            _serverStop = stop;
+            _serverTask = task;
+            _ = ObserveServerAsync(task, stop);
         }
-        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
             SetStatus($"未运行：{ex.Message}");
@@ -104,7 +113,22 @@ internal sealed class TrayContext : ApplicationContext
                 OpenConfig();
             }
         }
-        finally { _firstStart = false; }
+        finally
+        {
+            _firstStart = false;
+            _restart.Enabled = true;
+            _restarting = false;
+        }
+    }
+
+    private async Task ObserveServerAsync(Task task, CancellationTokenSource stop)
+    {
+        try { await task; }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            if (ReferenceEquals(_serverStop, stop)) SetStatus($"服务已停止：{ex.Message}");
+        }
     }
 
     private void SetStatus(string text)
@@ -141,7 +165,9 @@ internal sealed record BridgeConfig
         if (!IPAddress.TryParse(ListenHost, out _)) throw new InvalidDataException("listenHost 必须是 IP 地址");
         if (Port is < 1 or > 65535) throw new InvalidDataException("port 必须在 1 到 65535 之间");
         if (string.IsNullOrEmpty(Token) || Token == "change-me") throw new InvalidDataException("请设置非默认 token");
-        if (EdgeThreshold < 0 || ReturnThreshold <= 0) throw new InvalidDataException("阈值必须为正数");
+        if (!double.IsFinite(EdgeThreshold) || !double.IsFinite(ReturnThreshold) ||
+            EdgeThreshold is < 0 or > 100 || ReturnThreshold is < 1 or > 1_000)
+            throw new InvalidDataException("阈值超出允许范围");
     }
 }
 
@@ -160,7 +186,12 @@ internal sealed class BridgeServer(BridgeConfig config, Action<string>? report =
                 using var client = await _listener.AcceptTcpClientAsync(cancellationToken);
                 client.NoDelay = true;
                 try { await ServeAsync(client, cancellationToken); }
-                catch (Exception ex) when ((ex is IOException or SocketException) && !cancellationToken.IsCancellationRequested)
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    report?.Invoke("客户端认证超时，继续等待连接");
+                }
+                catch (Exception ex) when ((ex is IOException or SocketException or InvalidDataException or JsonException) &&
+                                             !cancellationToken.IsCancellationRequested)
                 {
                     report?.Invoke($"连接中断：{ex.Message}");
                 }
@@ -173,12 +204,13 @@ internal sealed class BridgeServer(BridgeConfig config, Action<string>? report =
     {
         var input = new WindowsInput(config);
         var stream = client.GetStream();
+        var reader = new JsonLineReader(stream);
         report?.Invoke($"Mac 已连接：{client.Client.RemoteEndPoint}");
         try
         {
             using var authTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             authTimeout.CancelAfter(TimeSpan.FromSeconds(5));
-            var authLine = await Json.ReadLineAsync(stream, authTimeout.Token);
+            var authLine = await reader.ReadLineAsync(authTimeout.Token);
             if (authLine is null || !Protocol.Authenticates(authLine, config.Token))
             {
                 await Json.WriteAsync(stream, new { type = "auth_failed" }, cancellationToken);
@@ -188,7 +220,7 @@ internal sealed class BridgeServer(BridgeConfig config, Action<string>? report =
             await Json.WriteAsync(stream, new { type = "auth_ok" }, cancellationToken);
             report?.Invoke("Mac 已连接并通过认证");
 
-            while (await Json.ReadLineAsync(stream, cancellationToken) is { } line)
+            while (await reader.ReadLineAsync(cancellationToken) is { } line)
             {
                 try
                 {
@@ -215,13 +247,15 @@ internal static class Protocol
         {
             using var document = JsonDocument.Parse(json);
             var root = document.RootElement;
-            if (!root.TryGetProperty("type", out var type) || type.GetString() != "auth" ||
+            if (root.ValueKind != JsonValueKind.Object ||
+                !root.TryGetProperty("type", out var type) || type.ValueKind != JsonValueKind.String ||
+                type.GetString() != "auth" ||
                 !root.TryGetProperty("token", out var token) || token.ValueKind != JsonValueKind.String) return false;
             var supplied = Encoding.UTF8.GetBytes(token.GetString()!);
             var expected = Encoding.UTF8.GetBytes(expectedToken);
             return supplied.Length == expected.Length && CryptographicOperations.FixedTimeEquals(supplied, expected);
         }
-        catch (JsonException) { return false; }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException) { return false; }
     }
 }
 
@@ -231,6 +265,7 @@ internal sealed class WindowsInput
     private readonly ReturnAccumulator _returning;
     private readonly HashSet<ushort> _keys = [];
     private readonly HashSet<string> _buttons = [];
+    private readonly FractionalDelta _moveX = new(), _moveY = new(), _scrollX = new(), _scrollY = new();
     private bool _active;
 
     public WindowsInput(BridgeConfig config)
@@ -241,12 +276,15 @@ internal sealed class WindowsInput
 
     public object? Handle(JsonElement message)
     {
-        if (!message.TryGetProperty("type", out var typeProperty)) return null;
+        if (message.ValueKind != JsonValueKind.Object ||
+            !message.TryGetProperty("type", out var typeProperty) || typeProperty.ValueKind != JsonValueKind.String)
+            return null;
         var type = typeProperty.GetString();
         if (type == "enter_pc" && Number(message, "xRatio") is { } ratio)
         {
             ReleaseAll();
             var desktop = Native.Desktop();
+            if (desktop.Width <= 0 || desktop.Height <= 0) return null;
             Native.SetCursorPos(Ratio.MapToPixel(ratio, desktop.Left, desktop.Width), desktop.Bottom - 2);
             _active = true;
             _returning.Reset();
@@ -257,12 +295,16 @@ internal sealed class WindowsInput
         switch (type)
         {
             case "move" when Number(message, "dx") is { } dx && Number(message, "dy") is { } dy:
-                Native.MouseMove(ClampDelta(dx), ClampDelta(dy));
+                var moveX = _moveX.Take(dx);
+                var moveY = _moveY.Take(dy);
+                if (moveX != 0 || moveY != 0) Native.MouseMove(moveX, moveY);
                 if (Native.GetCursorPos(out var point))
                 {
                     var desktop = Native.Desktop();
-                    var atBottom = point.Y >= desktop.Bottom - _config.EdgeThreshold;
-                    if (_returning.Update(atBottom, dy, Environment.TickCount64 / 1000.0))
+                    var atBottom = desktop.Width > 0 && desktop.Height > 0 &&
+                        point.Y >= desktop.Bottom - _config.EdgeThreshold;
+                    if (_returning.Update(atBottom, Math.Clamp(dy, -100_000, 100_000),
+                                          Environment.TickCount64 / 1000.0))
                     {
                         var xRatio = Ratio.FromPosition(point.X, desktop.Left, desktop.Width);
                         ReleaseAll();
@@ -278,7 +320,8 @@ internal sealed class WindowsInput
                 if (Native.MouseButton(upButton, false)) _buttons.Remove(upButton);
                 break;
             case "scroll":
-                Native.Scroll(ClampDelta(Number(message, "dx") ?? 0), ClampDelta(Number(message, "dy") ?? 0));
+                Native.Scroll(_scrollX.Take(Number(message, "dx") ?? 0),
+                              _scrollY.Take(Number(message, "dy") ?? 0));
                 break;
             case "key_down" when Text(message, "key") is { } downKey && Native.TryVirtualKey(downKey, out var downVk):
                 Native.Key(downVk, true);
@@ -298,17 +341,38 @@ internal sealed class WindowsInput
         foreach (var button in _buttons) Native.MouseButton(button, false);
         _keys.Clear();
         _buttons.Clear();
+        _moveX.Reset();
+        _moveY.Reset();
+        _scrollX.Reset();
+        _scrollY.Reset();
         _returning.Reset();
     }
 
     private static double? Number(JsonElement root, string name) =>
-        root.TryGetProperty(name, out var value) && value.TryGetDouble(out var number) && double.IsFinite(number)
+        root.ValueKind == JsonValueKind.Object && root.TryGetProperty(name, out var value) &&
+        value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out var number) && double.IsFinite(number)
             ? number : null;
 
     private static string? Text(JsonElement root, string name) =>
-        root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+        root.ValueKind == JsonValueKind.Object && root.TryGetProperty(name, out var value) &&
+        value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
-    private static int ClampDelta(double value) => (int)Math.Clamp(Math.Round(value), -100_000, 100_000);
+}
+
+internal sealed class FractionalDelta
+{
+    private double _remainder;
+
+    public int Take(double value)
+    {
+        if (!double.IsFinite(value)) { Reset(); return 0; }
+        var total = _remainder + Math.Clamp(value, -100_000, 100_000);
+        var whole = Math.Truncate(total);
+        _remainder = total - whole;
+        return (int)whole;
+    }
+
+    public void Reset() => _remainder = 0;
 }
 
 internal sealed class ReturnAccumulator(double threshold, double idleResetSeconds = 0.5)
@@ -319,13 +383,20 @@ internal sealed class ReturnAccumulator(double threshold, double idleResetSecond
 
     public bool Update(bool atEdge, double downwardDelta, double now)
     {
-        if (!atEdge || downwardDelta <= 0 || (_lastUpdate is { } last && now - last > idleResetSeconds)) _total = 0;
+        if (!double.IsFinite(threshold) || threshold <= 0 || !double.IsFinite(idleResetSeconds) ||
+            idleResetSeconds < 0 || !double.IsFinite(downwardDelta) || !double.IsFinite(now))
+        {
+            Reset();
+            return false;
+        }
+        if (!atEdge || downwardDelta <= 0 ||
+            (_lastUpdate is { } last && (now < last || now - last > idleResetSeconds))) _total = 0;
         if (!atEdge || downwardDelta <= 0)
         {
             _lastUpdate = null;
             return false;
         }
-        _total += downwardDelta;
+        _total = Math.Min(threshold, _total + downwardDelta);
         _lastUpdate = now;
         if (_total < threshold) return false;
         Reset();
@@ -338,32 +409,55 @@ internal sealed class ReturnAccumulator(double threshold, double idleResetSecond
 internal static class Ratio
 {
     public static double FromPosition(double position, double origin, double length) =>
-        length <= 0 ? 0 : Math.Clamp((position - origin) / length, 0, 1);
+        !double.IsFinite(position) || !double.IsFinite(origin) || !double.IsFinite(length) || length <= 0
+            ? 0 : Math.Clamp((position - origin) / length, 0, 1);
 
     public static int MapToPixel(double ratio, int origin, int length)
     {
         if (!double.IsFinite(ratio) || length <= 0) return origin;
-        return (int)Math.Clamp(Math.Round(origin + length * Math.Clamp(ratio, 0, 1)), origin, origin + length - 1);
+        var mapped = origin + (double)length * Math.Clamp(ratio, 0, 1);
+        return (int)Math.Clamp(Math.Round(mapped), origin, origin + (double)length - 1);
+    }
+}
+
+internal sealed class JsonLineReader(NetworkStream stream)
+{
+    private readonly byte[] _buffer = new byte[8_192];
+    private int _offset;
+    private int _count;
+
+    public async Task<string?> ReadLineAsync(CancellationToken cancellationToken)
+    {
+        using var line = new MemoryStream();
+        while (true)
+        {
+            if (_offset < _count)
+            {
+                var newline = Array.IndexOf(_buffer, (byte)'\n', _offset, _count - _offset);
+                var end = newline >= 0 ? newline : _count;
+                var length = end - _offset;
+                if (line.Length + length > 65_536) throw new InvalidDataException("协议行超过 65536 字节");
+                line.Write(_buffer, _offset, length);
+                _offset = newline >= 0 ? newline + 1 : _count;
+                if (newline >= 0)
+                {
+                    var data = line.ToArray();
+                    var size = data.Length > 0 && data[^1] == (byte)'\r' ? data.Length - 1 : data.Length;
+                    return Encoding.UTF8.GetString(data, 0, size);
+                }
+            }
+
+            _count = await stream.ReadAsync(_buffer, cancellationToken);
+            _offset = 0;
+            if (_count == 0)
+                return line.Length == 0 ? null : Encoding.UTF8.GetString(line.ToArray());
+        }
     }
 }
 
 internal static class Json
 {
     public static readonly JsonSerializerOptions Options = new() { PropertyNameCaseInsensitive = true };
-
-    public static async Task<string?> ReadLineAsync(NetworkStream stream, CancellationToken cancellationToken)
-    {
-        using var bytes = new MemoryStream();
-        var one = new byte[1];
-        while (bytes.Length <= 65_536)
-        {
-            var count = await stream.ReadAsync(one, cancellationToken);
-            if (count == 0) return bytes.Length == 0 ? null : Encoding.UTF8.GetString(bytes.ToArray());
-            if (one[0] == (byte)'\n') return Encoding.UTF8.GetString(bytes.ToArray());
-            if (one[0] != (byte)'\r') bytes.WriteByte(one[0]);
-        }
-        throw new InvalidDataException("protocol line exceeds 65536 bytes");
-    }
 
     public static async Task WriteAsync(NetworkStream stream, object value, CancellationToken cancellationToken)
     {
@@ -407,8 +501,8 @@ internal static class Native
 
     public static void Scroll(int dx, int dy)
     {
-        if (dy != 0) SendMouse(0, 0, unchecked((uint)(dy * 120)), Wheel);
-        if (dx != 0) SendMouse(0, 0, unchecked((uint)(dx * 120)), HWheel);
+        if (dy != 0) SendMouse(0, 0, unchecked((uint)dy), Wheel);
+        if (dx != 0) SendMouse(0, 0, unchecked((uint)dx), HWheel);
     }
 
     public static void Key(ushort virtualKey, bool down)
@@ -491,11 +585,20 @@ internal static class SelfTests
             Assert(!crossing.Update(true, -1, 2.1), "reverse resets");
             Assert(!crossing.Update(true, 4, 3), "pause resets");
             Assert(crossing.Total == 4, "post-pause total");
+            Assert(!crossing.Update(true, double.NaN, 3.1) && crossing.Total == 0, "invalid delta resets");
+            Assert(!crossing.Update(true, 6, 4), "clock baseline");
+            Assert(!crossing.Update(true, 6, 3.9) && crossing.Total == 6, "backward clock resets");
             Assert(Ratio.FromPosition(-960, -1920, 1920) == 0.5, "virtual desktop ratio");
             Assert(Ratio.MapToPixel(2, -1920, 1920) == -1, "ratio clamp");
+            Assert(Ratio.FromPosition(double.NaN, 0, 100) == 0, "invalid ratio input");
+            var fractional = new FractionalDelta();
+            Assert(fractional.Take(0.5) == 0 && fractional.Take(0.5) == 1, "fractional motion accumulates");
+            Assert(fractional.Take(-0.25) == 0 && fractional.Take(-0.75) == -1, "negative fraction accumulates");
             Assert(Protocol.Authenticates("{\"type\":\"auth\",\"token\":\"secret\"}", "secret"), "auth accepts token");
             Assert(!Protocol.Authenticates("{\"type\":\"move\",\"token\":\"secret\"}", "secret"), "input cannot authenticate");
             Assert(!Protocol.Authenticates("{\"type\":\"auth\",\"token\":\"wrong\"}", "secret"), "auth rejects token");
+            Assert(!Protocol.Authenticates("{\"type\":1,\"token\":\"secret\"}", "secret"), "auth rejects wrong JSON kinds");
+            RunServerResilienceAsync().GetAwaiter().GetResult();
             Console.WriteLine("winbridge self-tests: passed");
             return 0;
         }
@@ -504,6 +607,50 @@ internal static class SelfTests
             Console.Error.WriteLine($"winbridge self-tests: failed: {ex.Message}");
             return 1;
         }
+    }
+
+    private static async Task RunServerResilienceAsync()
+    {
+        var reservation = new TcpListener(IPAddress.Loopback, 0);
+        reservation.Start();
+        var port = ((IPEndPoint)reservation.LocalEndpoint).Port;
+        reservation.Stop();
+        var config = new BridgeConfig { ListenHost = "127.0.0.1", Port = port, Token = "secret" };
+        using var stop = new CancellationTokenSource();
+        var server = Task.Run(() => new BridgeServer(config).RunAsync(stop.Token));
+        await Task.Delay(100);
+
+        using (var malformed = new TcpClient())
+        {
+            await malformed.ConnectAsync(IPAddress.Loopback, port);
+            using var reader = new StreamReader(malformed.GetStream(), Encoding.UTF8, leaveOpen: true);
+            using var writer = new StreamWriter(malformed.GetStream(), new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+            await writer.WriteLineAsync("{\"type\":1,\"token\":\"secret\"}");
+            Assert((await reader.ReadLineAsync())?.Contains("auth_failed") == true, "malformed auth is contained");
+        }
+
+        using (var authenticated = new TcpClient())
+        {
+            await authenticated.ConnectAsync(IPAddress.Loopback, port);
+            using var reader = new StreamReader(authenticated.GetStream(), Encoding.UTF8, leaveOpen: true);
+            using var writer = new StreamWriter(authenticated.GetStream(), new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+            await writer.WriteLineAsync("{\"type\":\"auth\",\"token\":\"secret\"}");
+            Assert((await reader.ReadLineAsync())?.Contains("auth_ok") == true, "server survives malformed client");
+            await writer.WriteLineAsync("[]");
+            await writer.WriteLineAsync("{\"type\":\"move\",\"dx\":\"bad\",\"dy\":1}");
+        }
+
+        using (var next = new TcpClient())
+        {
+            await next.ConnectAsync(IPAddress.Loopback, port);
+            using var reader = new StreamReader(next.GetStream(), Encoding.UTF8, leaveOpen: true);
+            using var writer = new StreamWriter(next.GetStream(), new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+            await writer.WriteLineAsync("{\"type\":\"auth\",\"token\":\"secret\"}");
+            Assert((await reader.ReadLineAsync())?.Contains("auth_ok") == true, "listener remains available");
+        }
+
+        stop.Cancel();
+        try { await server; } catch (OperationCanceledException) { }
     }
 
     private static void Assert(bool condition, string name)

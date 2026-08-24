@@ -31,9 +31,10 @@ public struct MacConfig: Codable, Equatable {
         guard !token.isEmpty && token != "change-me" else { throw ConfigError.invalid("请设置非默认 token") }
         guard pcSide == "top" else { throw ConfigError.invalid("pcSide 必须为 top") }
         let numbers = [edgeThreshold, crossingThreshold, returnThreshold, sensitivity, scrollScale]
-        guard numbers.allSatisfy(\.isFinite), edgeThreshold >= 0, crossingThreshold > 0,
-              returnThreshold > 0, sensitivity > 0, scrollScale > 0 else {
-            throw ConfigError.invalid("阈值和倍率必须是有效的正数")
+        guard numbers.allSatisfy(\.isFinite), (0...100).contains(edgeThreshold),
+              (1...1_000).contains(crossingThreshold), (1...1_000).contains(returnThreshold),
+              (0.05...10).contains(sensitivity), (0.05...10).contains(scrollScale) else {
+            throw ConfigError.invalid("阈值或倍率超出允许范围")
         }
     }
 
@@ -81,14 +82,19 @@ public struct CrossingAccumulator {
 
     /// Pass a positive logical outward delta. Zero/negative, leaving the edge, or pausing resets intent.
     public mutating func update(atEdge: Bool, outwardDelta: Double, now: TimeInterval) -> Bool {
-        if !atEdge || outwardDelta <= 0 || lastUpdate.map({ now - $0 > idleResetSeconds }) == true {
+        guard threshold.isFinite, threshold > 0, idleResetSeconds.isFinite, idleResetSeconds >= 0,
+              outwardDelta.isFinite, now.isFinite else {
+            reset()
+            return false
+        }
+        if !atEdge || outwardDelta <= 0 || lastUpdate.map({ now < $0 || now - $0 > idleResetSeconds }) == true {
             total = 0
         }
         guard atEdge, outwardDelta > 0 else {
             lastUpdate = nil
             return false
         }
-        total += outwardDelta
+        total = min(threshold, total + outwardDelta)
         lastUpdate = now
         if total >= threshold {
             reset()
@@ -104,14 +110,40 @@ public struct CrossingAccumulator {
 }
 
 public func clampedRatio(position: Double, origin: Double, length: Double) -> Double {
-    guard length > 0 else { return 0 }
+    guard position.isFinite, origin.isFinite, length.isFinite, length > 0 else { return 0 }
     return min(1, max(0, (position - origin) / length))
 }
 
 public func clampedPosition(ratio: Double, origin: Double, length: Double, farInset: Double = 1) -> Double {
-    guard length > 0 else { return origin }
+    guard origin.isFinite, length.isFinite, length > 0 else { return origin.isFinite ? origin : 0 }
     let safeRatio = ratio.isFinite ? min(1, max(0, ratio)) : 0
-    return min(origin + max(0, length - farInset), origin + length * safeRatio)
+    let inset = farInset.isFinite ? min(length, max(0, farInset)) : 1
+    return min(origin + length - inset, origin + length * safeRatio)
+}
+
+public func sanitizedDelta(_ value: Double, scale: Double, limit: Double = 1_000) -> Double {
+    guard value.isFinite, scale.isFinite, limit.isFinite, scale > 0, limit > 0 else { return 0 }
+    return min(limit, max(-limit, value * scale))
+}
+
+public struct DeltaAccumulator {
+    public private(set) var dx: Double = 0
+    public private(set) var dy: Double = 0
+    public init() {}
+
+    public mutating func add(dx: Double, dy: Double, limit: Double = 10_000) {
+        guard dx.isFinite, dy.isFinite, limit.isFinite, limit > 0 else { return }
+        self.dx = min(limit, max(-limit, self.dx + dx))
+        self.dy = min(limit, max(-limit, self.dy + dy))
+    }
+
+    public mutating func drain() -> (dx: Double, dy: Double)? {
+        guard dx != 0 || dy != 0 else { return nil }
+        defer { dx = 0; dy = 0 }
+        return (dx, dy)
+    }
+
+    public mutating func reset() { dx = 0; dy = 0 }
 }
 
 public struct WireMessage: Codable, Equatable {

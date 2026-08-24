@@ -7,8 +7,12 @@ import MacBridgeCore
 
 final class SocketClient {
     private var fd: Int32 = -1
-    private let writeLock = NSLock()
-    private let stateLock = NSLock()
+    private let writerQueue = DispatchQueue(label: "com.macbridge.socket-writer", qos: .userInteractive)
+    private let stateLock = NSCondition()
+    private var activeIO = 0
+    private var receiveBuffer = [UInt8](repeating: 0, count: 8_192)
+    private var receiveOffset = 0
+    private var receiveCount = 0
     private var stopped = false
     var onMessage: ((WireMessage) -> Void)?
     var onDisconnect: ((String) -> Void)?
@@ -31,9 +35,15 @@ final class SocketClient {
             let candidate = socket(address.pointee.ai_family, address.pointee.ai_socktype, address.pointee.ai_protocol)
             if candidate >= 0 {
                 var one: Int32 = 1
+                var timeout = timeval(tv_sec: 1, tv_usec: 0)
                 setsockopt(candidate, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout.size(ofValue: one)))
-                if Darwin.connect(candidate, address.pointee.ai_addr, address.pointee.ai_addrlen) == 0 {
+                setsockopt(candidate, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout.size(ofValue: timeout)))
+                setsockopt(candidate, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout.size(ofValue: one)))
+                if connectWithTimeout(candidate, address: address.pointee.ai_addr,
+                                      length: address.pointee.ai_addrlen) {
+                    stateLock.lock()
                     fd = candidate
+                    stateLock.unlock()
                     break
                 }
                 Darwin.close(candidate)
@@ -45,7 +55,10 @@ final class SocketClient {
                           userInfo: [NSLocalizedDescriptionKey: "无法连接到 \(host):\(port)"])
         }
 
-        guard send(WireMessage(type: "auth", token: token)),
+        stateLock.lock()
+        stopped = false
+        stateLock.unlock()
+        guard sendBlocking(WireMessage(type: "auth", token: token)),
               let line = readLine(maxBytes: 65_536),
               let reply = try? JSONDecoder().decode(WireMessage.self, from: line),
               reply.type == "auth_ok" else {
@@ -53,6 +66,21 @@ final class SocketClient {
             throw NSError(domain: "MacBridge", code: 3,
                           userInfo: [NSLocalizedDescriptionKey: "认证失败，请检查两端 token"])
         }
+    }
+
+    private func connectWithTimeout(_ socket: Int32, address: UnsafePointer<sockaddr>?,
+                                    length: socklen_t) -> Bool {
+        let flags = fcntl(socket, F_GETFL, 0)
+        guard flags >= 0, fcntl(socket, F_SETFL, flags | O_NONBLOCK) == 0 else { return false }
+        defer { _ = fcntl(socket, F_SETFL, flags) }
+        if Darwin.connect(socket, address, length) == 0 { return true }
+        guard errno == EINPROGRESS else { return false }
+        var descriptor = pollfd(fd: socket, events: Int16(POLLOUT), revents: 0)
+        guard poll(&descriptor, 1, 3_000) > 0 else { return false }
+        var error: Int32 = 0
+        var errorLength = socklen_t(MemoryLayout.size(ofValue: error))
+        guard getsockopt(socket, SOL_SOCKET, SO_ERROR, &error, &errorLength) == 0 else { return false }
+        return error == 0
     }
 
     func startReading() {
@@ -67,57 +95,93 @@ final class SocketClient {
     }
 
     @discardableResult func send(_ message: WireMessage) -> Bool {
+        stateLock.lock()
+        let connected = !stopped && fd >= 0
+        stateLock.unlock()
+        guard connected else { return false }
+        writerQueue.async { [weak self] in
+            guard let self, !self.sendBlocking(message) else { return }
+            self.finish(reason: "向 Windows 发送数据失败")
+        }
+        return true
+    }
+
+    private func sendBlocking(_ message: WireMessage) -> Bool {
         guard let encoded = try? JSONEncoder().encode(message) else { return false }
         var data = encoded
         data.append(0x0A)
-        writeLock.lock()
-        defer { writeLock.unlock() }
+        guard let socket = beginIO() else { return false }
+        defer { endIO() }
         var sent = 0
-        let result = data.withUnsafeBytes { bytes -> Bool in
+        return data.withUnsafeBytes { bytes -> Bool in
             guard let base = bytes.baseAddress else { return false }
             while sent < bytes.count {
-                let count = Darwin.send(fd, base.advanced(by: sent), bytes.count - sent, 0)
+                let count = Darwin.send(socket, base.advanced(by: sent), bytes.count - sent, 0)
                 if count <= 0 { return false }
                 sent += count
             }
             return true
         }
-        return result
     }
 
     private func readLine(maxBytes: Int) -> Data? {
         var line = Data()
-        var byte: UInt8 = 0
-        while line.count < maxBytes {
-            let count = Darwin.recv(fd, &byte, 1, 0)
-            guard count > 0 else { return nil }
-            if byte == 0x0A { return line }
-            if byte != 0x0D { line.append(byte) }
+        while true {
+            if receiveOffset < receiveCount {
+                let newline = receiveBuffer[receiveOffset..<receiveCount].firstIndex(of: 0x0A)
+                let end = newline ?? receiveCount
+                guard line.count + end - receiveOffset <= maxBytes else { return nil }
+                line.append(contentsOf: receiveBuffer[receiveOffset..<end])
+                receiveOffset = newline.map { $0 + 1 } ?? receiveCount
+                if newline != nil {
+                    if line.last == 0x0D { line.removeLast() }
+                    return line
+                }
+            }
+
+            guard let socket = beginIO() else { return nil }
+            let received = receiveBuffer.withUnsafeMutableBytes { bytes in
+                Darwin.recv(socket, bytes.baseAddress, bytes.count, 0)
+            }
+            endIO()
+            guard received > 0 else { return nil }
+            receiveOffset = 0
+            receiveCount = received
         }
-        return nil
     }
 
-    func close() {
+    private func beginIO() -> Int32? {
         stateLock.lock()
-        stopped = true
-        let socket = fd
-        fd = -1
-        stateLock.unlock()
-        if socket >= 0 {
-            Darwin.shutdown(socket, SHUT_RDWR)
-            Darwin.close(socket)
-        }
+        defer { stateLock.unlock() }
+        guard !stopped, fd >= 0 else { return nil }
+        activeIO += 1
+        return fd
     }
 
-    private func finish(reason: String) {
+    private func endIO() {
+        stateLock.lock()
+        activeIO -= 1
+        stateLock.broadcast()
+        stateLock.unlock()
+    }
+
+    func close() { _ = closeSocket() }
+
+    private func closeSocket() -> Bool {
         stateLock.lock()
         let shouldNotify = !stopped
         stopped = true
         let socket = fd
         fd = -1
+        if socket >= 0 { Darwin.shutdown(socket, SHUT_RDWR) }
+        while activeIO > 0 { stateLock.wait() }
         stateLock.unlock()
         if socket >= 0 { Darwin.close(socket) }
-        if shouldNotify { onDisconnect?(reason) }
+        return shouldNotify
+    }
+
+    private func finish(reason: String) {
+        if closeSocket() { onDisconnect?(reason) }
     }
 }
 
@@ -128,9 +192,16 @@ final class BridgeController {
     private var crossing: CrossingAccumulator
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+    private var flushTimer: DispatchSourceTimer?
+    private var watchdogTimer: DispatchSourceTimer?
+    private var movement = DeltaAccumulator()
+    private var scrolling = DeltaAccumulator()
+    private var localModifierCodes = Set<Int64>()
+    private var forwardedModifierCodes = Set<Int64>()
+    private var tapRecoveryFailures = 0
     private var savedScreen = CGRect.zero
     private var savedDisplay = CGMainDisplayID()
-    private var cursorHidden = false
+    private var cursorHideDepth = 0
     private var shuttingDown = false
     var onConnectionLost: ((String) -> Void)?
 
@@ -147,7 +218,7 @@ final class BridgeController {
             .otherMouseDown, .otherMouseUp, .scrollWheel, .keyDown, .keyUp, .flagsChanged
         ]
         let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
-        guard let created = CGEvent.tapCreate(tap: .cgSessionEventTap,
+        guard let created = CGEvent.tapCreate(tap: .cghidEventTap,
                                                place: .headInsertEventTap,
                                                options: .defaultTap,
                                                eventsOfInterest: mask,
@@ -161,20 +232,27 @@ final class BridgeController {
         runLoopSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: created, enable: true)
+        startTimers()
     }
 
     func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
-            return Unmanaged.passUnretained(event)
+            if state.mode == .pcActive {
+                resynchronizeModifiers(forward: true)
+                hideMacCursor()
+            }
+            return nil
         }
 
         if state.mode == .macActive {
+            if type == .flagsChanged { updateModifierState(event, forward: false) }
             guard isMovement(type) else { return Unmanaged.passUnretained(event) }
             let point = event.location
             let screen = display(at: point)
-            let dy = event.getDoubleValueField(.mouseEventDeltaY)
-            let atTop = point.y <= screen.bounds.minY + config.edgeThreshold
+            let dy = sanitizedDelta(event.getDoubleValueField(.mouseEventDeltaY), scale: 1, limit: 200)
+            let atTop = point.x.isFinite && point.y.isFinite && screen.bounds.width > 0 &&
+                point.y <= screen.bounds.minY + config.edgeThreshold
             if crossing.update(atEdge: atTop, outwardDelta: -dy,
                                now: ProcessInfo.processInfo.systemUptime) {
                 enterPC(at: point, screen: screen)
@@ -185,23 +263,29 @@ final class BridgeController {
 
         switch type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-            send(WireMessage(type: "move",
-                             dx: event.getDoubleValueField(.mouseEventDeltaX) * config.sensitivity,
-                             dy: event.getDoubleValueField(.mouseEventDeltaY) * config.sensitivity))
+            movement.add(
+                dx: sanitizedDelta(event.getDoubleValueField(.mouseEventDeltaX), scale: config.sensitivity),
+                dy: sanitizedDelta(event.getDoubleValueField(.mouseEventDeltaY), scale: config.sensitivity)
+            )
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            flushPointerInput()
             send(WireMessage(type: "mouse_down", button: mouseButton(type: type)))
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            flushPointerInput()
             send(WireMessage(type: "mouse_up", button: mouseButton(type: type)))
         case .scrollWheel:
-            let dx = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2) * config.scrollScale
-            let dy = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1) * config.scrollScale
-            send(WireMessage(type: "scroll", dx: dx, dy: dy))
+            scrolling.add(
+                dx: sanitizedDelta(event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2), scale: config.scrollScale),
+                dy: sanitizedDelta(event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1), scale: config.scrollScale)
+            )
         case .keyDown, .keyUp:
+            flushPointerInput()
             guard let key = keyName(code: event.getIntegerValueField(.keyboardEventKeycode)) else { break }
             send(WireMessage(type: type == .keyDown ? "key_down" : "key_up",
                              key: key, meta: modifierNames(event.flags)))
         case .flagsChanged:
-            forwardModifier(event)
+            flushPointerInput()
+            updateModifierState(event, forward: true)
         default:
             break
         }
@@ -224,6 +308,10 @@ final class BridgeController {
         guard !shuttingDown else { return }
         shuttingDown = true
         safetyRestore()
+        flushTimer?.cancel()
+        watchdogTimer?.cancel()
+        flushTimer = nil
+        watchdogTimer = nil
         if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let source = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
         client.close()
@@ -234,11 +322,15 @@ final class BridgeController {
         savedDisplay = screen.id
         savedScreen = screen.bounds
         let ratio = clampedRatio(position: point.x, origin: screen.bounds.minX, length: screen.bounds.width)
-        CGWarpMouseCursorPosition(CGPoint(x: point.x, y: screen.bounds.minY))
+        movement.reset()
+        scrolling.reset()
+        resynchronizeModifiers(forward: false)
+        forwardedModifierCodes.removeAll()
         CGAssociateMouseAndMouseCursorPosition(boolean_t(0))
-        CGDisplayHideCursor(screen.id)
-        cursorHidden = true
-        if !client.send(WireMessage(type: "enter_pc", xRatio: ratio)) {
+        hideMacCursor()
+        if client.send(WireMessage(type: "enter_pc", xRatio: ratio)) {
+            forwardCurrentModifiers()
+        } else {
             connectionLost("发送失败")
         }
     }
@@ -246,11 +338,11 @@ final class BridgeController {
     private func restoreMac(ratio: Double) {
         guard state.returnToMac() else { return }
         crossing.reset()
+        movement.reset()
+        scrolling.reset()
+        forwardedModifierCodes.removeAll()
         CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-        if cursorHidden {
-            CGDisplayShowCursor(savedDisplay)
-            cursorHidden = false
-        }
+        restoreMacCursorVisibility()
         let x = clampedPosition(ratio: ratio, origin: savedScreen.minX, length: savedScreen.width)
         CGWarpMouseCursorPosition(CGPoint(x: x, y: savedScreen.minY + 2))
     }
@@ -258,10 +350,78 @@ final class BridgeController {
     private func safetyRestore() {
         if state.mode == .pcActive { _ = state.returnToMac() }
         crossing.reset()
+        movement.reset()
+        scrolling.reset()
+        forwardedModifierCodes.removeAll()
         CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-        if cursorHidden {
+        restoreMacCursorVisibility()
+    }
+
+    private func startTimers() {
+        let flush = DispatchSource.makeTimerSource(queue: .main)
+        flush.schedule(deadline: .now() + .milliseconds(8), repeating: .milliseconds(8), leeway: .milliseconds(2))
+        flush.setEventHandler { [weak self] in self?.flushPointerInput() }
+        flush.resume()
+        flushTimer = flush
+
+        let watchdog = DispatchSource.makeTimerSource(queue: .main)
+        watchdog.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250),
+                          leeway: .milliseconds(50))
+        watchdog.setEventHandler { [weak self] in self?.monitorCapture() }
+        watchdog.resume()
+        watchdogTimer = watchdog
+    }
+
+    private func flushPointerInput() {
+        guard state.mode == .pcActive else {
+            movement.reset()
+            scrolling.reset()
+            return
+        }
+        if let delta = movement.drain() {
+            send(WireMessage(type: "move", dx: delta.dx, dy: delta.dy))
+        }
+        if let delta = scrolling.drain() {
+            send(WireMessage(type: "scroll", dx: delta.dx, dy: delta.dy))
+        }
+    }
+
+    private func monitorCapture() {
+        guard !shuttingDown, let tap else { return }
+        if !CGEvent.tapIsEnabled(tap: tap) {
+            CGEvent.tapEnable(tap: tap, enable: true)
+            if !CGEvent.tapIsEnabled(tap: tap) {
+                tapRecoveryFailures += 1
+                if tapRecoveryFailures >= 3 { connectionLost("系统已禁用输入捕获") }
+                return
+            }
+            if state.mode == .pcActive {
+                resynchronizeModifiers(forward: true)
+                hideMacCursor()
+            }
+        }
+        tapRecoveryFailures = 0
+    }
+
+    func reassertCapture() {
+        guard state.mode == .pcActive else { return }
+        if let tap, !CGEvent.tapIsEnabled(tap: tap) {
+            CGEvent.tapEnable(tap: tap, enable: true)
+            guard CGEvent.tapIsEnabled(tap: tap) else { return }
+        }
+        resynchronizeModifiers(forward: true)
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(0))
+        hideMacCursor()
+    }
+
+    private func hideMacCursor() {
+        if CGDisplayHideCursor(savedDisplay) == .success { cursorHideDepth += 1 }
+    }
+
+    private func restoreMacCursorVisibility() {
+        while cursorHideDepth > 0 {
             CGDisplayShowCursor(savedDisplay)
-            cursorHidden = false
+            cursorHideDepth -= 1
         }
     }
 
@@ -287,24 +447,52 @@ final class BridgeController {
         return "middle"
     }
 
-    private func forwardModifier(_ event: CGEvent) {
+    private func updateModifierState(_ event: CGEvent, forward: Bool) {
         let code = event.getIntegerValueField(.keyboardEventKeycode)
         guard let key = keyName(code: code) else { return }
-        let flag: CGEventFlags
-        switch code {
-        case 56, 60: flag = .maskShift
-        case 59, 62: flag = .maskControl
-        case 58, 61: flag = .maskAlternate
-        case 55, 54: flag = .maskCommand
-        case 57:
-            send(WireMessage(type: "key_down", key: key, meta: modifierNames(event.flags)))
-            send(WireMessage(type: "key_up", key: key, meta: modifierNames(event.flags)))
+        if code == 57 {
+            if forward {
+                send(WireMessage(type: "key_down", key: key, meta: modifierNames(event.flags)))
+                send(WireMessage(type: "key_up", key: key, meta: modifierNames(event.flags)))
+            }
             return
-        default: return
         }
-        send(WireMessage(type: event.flags.contains(flag) ? "key_down" : "key_up",
-                         key: key, meta: modifierNames(event.flags)))
+        guard [54, 55, 56, 58, 59, 60, 61, 62].contains(code) else { return }
+        let isDown = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(code))
+        if isDown { localModifierCodes.insert(code) } else { localModifierCodes.remove(code) }
+        guard forward else { return }
+        if isDown {
+            if forwardedModifierCodes.insert(code).inserted {
+                send(WireMessage(type: "key_down", key: key, meta: modifierNames(event.flags)))
+            }
+        } else if forwardedModifierCodes.remove(code) != nil {
+            send(WireMessage(type: "key_up", key: key, meta: modifierNames(event.flags)))
+        }
     }
+
+    private func resynchronizeModifiers(forward: Bool) {
+        let codes: [Int64] = [54, 55, 56, 58, 59, 60, 61, 62]
+        let actual = Set(codes.filter {
+            CGEventSource.keyState(.combinedSessionState, key: CGKeyCode($0))
+        })
+        localModifierCodes = actual
+        guard forward else { return }
+        for code in forwardedModifierCodes.subtracting(actual).sorted() {
+            if let key = keyName(code: code) { send(WireMessage(type: "key_up", key: key)) }
+            forwardedModifierCodes.remove(code)
+        }
+        forwardCurrentModifiers()
+    }
+
+    private func forwardCurrentModifiers() {
+        for code in localModifierCodes.sorted() where !forwardedModifierCodes.contains(code) {
+            if let key = keyName(code: code) {
+                forwardedModifierCodes.insert(code)
+                send(WireMessage(type: "key_down", key: key))
+            }
+        }
+    }
+
 }
 
 private func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent,
@@ -376,6 +564,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(item("退出 MacBridge", #selector(quit), "q"))
         statusItem.menu = menu
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(workspaceFocusChanged),
+            name: NSWorkspace.didActivateApplicationNotification, object: nil
+        )
 
         do {
             if try ensureConfig() { showWelcome() }
@@ -386,9 +578,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         connectAttempt = UUID()
         controller?.stop()
     }
+
+    @objc private func workspaceFocusChanged(_ notification: Notification) { controller?.reassertCapture() }
 
     @objc private func reconnect() {
         connectAttempt = UUID()
