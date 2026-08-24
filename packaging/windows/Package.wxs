@@ -28,8 +28,8 @@
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder" />
-    <CustomAction Id="LaunchWinBridge" FileRef="WinBridgeExe" Execute="immediate"
-                  Return="asyncNoWait" Impersonate="yes" />
+    <CustomAction Id="LaunchWinBridge" FileRef="WinBridgeExe" ExeCommand="--installed"
+                  Execute="immediate" Return="asyncNoWait" Impersonate="yes" />
     <InstallExecuteSequence>
       <Custom Action="LaunchWinBridge" After="InstallFinalize" Condition="NOT Installed" />
     </InstallExecuteSequence>
