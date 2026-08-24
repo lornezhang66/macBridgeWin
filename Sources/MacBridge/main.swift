@@ -1,3 +1,4 @@
+import AppKit
 import ApplicationServices
 import CoreGraphics
 import Darwin
@@ -131,6 +132,7 @@ final class BridgeController {
     private var savedDisplay = CGMainDisplayID()
     private var cursorHidden = false
     private var shuttingDown = false
+    var onConnectionLost: ((String) -> Void)?
 
     init(config: MacConfig, client: SocketClient) {
         self.config = config
@@ -214,19 +216,17 @@ final class BridgeController {
 
     func connectionLost(_ reason: String) {
         guard !shuttingDown else { return }
-        fputs("macbridge: \(reason)\n", stderr)
-        safetyRestore()
-        CFRunLoopStop(CFRunLoopGetMain())
+        stop()
+        onConnectionLost?(reason)
     }
 
-    func shutdown() {
+    func stop() {
         guard !shuttingDown else { return }
         shuttingDown = true
         safetyRestore()
         if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let source = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
         client.close()
-        CFRunLoopStop(CFRunLoopGetMain())
     }
 
     private func enterPC(at point: CGPoint, screen: (id: CGDirectDisplayID, bounds: CGRect)) {
@@ -350,47 +350,176 @@ private func loadConfig(path: String) throws -> MacConfig {
     return config
 }
 
-let arguments = CommandLine.arguments
-let configPath: String
-if let index = arguments.firstIndex(of: "--config"), arguments.indices.contains(index + 1) {
-    configPath = arguments[index + 1]
-} else {
-    configPath = "macbridge.json"
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    private let statusLine = NSMenuItem(title: "正在启动…", action: nil, keyEquivalent: "")
+    private var controller: BridgeController?
+    private var connectAttempt = UUID()
+
+    private var configURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MacBridge/macbridge.json")
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        statusItem.button?.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: "MacBridge")
+        statusItem.button?.toolTip = "MacBridge"
+
+        let menu = NSMenu()
+        statusLine.isEnabled = false
+        menu.addItem(statusLine)
+        menu.addItem(.separator())
+        menu.addItem(item("重新连接", #selector(reconnect), "r"))
+        menu.addItem(item("编辑配置…", #selector(openConfig), ","))
+        menu.addItem(item("打开使用说明…", #selector(openHelp), ""))
+        menu.addItem(.separator())
+        menu.addItem(item("退出 MacBridge", #selector(quit), "q"))
+        statusItem.menu = menu
+
+        do {
+            if try ensureConfig() { showWelcome() }
+        } catch {
+            setStatus("配置创建失败：\(error.localizedDescription)")
+        }
+        reconnect()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        connectAttempt = UUID()
+        controller?.stop()
+    }
+
+    @objc private func reconnect() {
+        connectAttempt = UUID()
+        controller?.stop()
+        controller = nil
+        setStatus("正在连接…")
+
+        let config: MacConfig
+        do { config = try loadConfig(path: configURL.path) }
+        catch {
+            setStatus("需要配置：请点击“编辑配置…”")
+            return
+        }
+
+        let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        guard AXIsProcessTrustedWithOptions(prompt) else {
+            setStatus("需要开启“辅助功能”权限")
+            return
+        }
+
+        let attempt = connectAttempt
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let client = SocketClient()
+            do {
+                try client.connect(host: config.host, port: config.port, token: config.token)
+                DispatchQueue.main.async {
+                    guard let self, self.connectAttempt == attempt else {
+                        client.close()
+                        return
+                    }
+                    self.activate(client: client, config: config)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard let self, self.connectAttempt == attempt else { return }
+                    self.setStatus("连接失败：\(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func activate(client: SocketClient, config: MacConfig) {
+        let controller = BridgeController(config: config, client: client)
+        client.onMessage = { [weak controller] message in
+            DispatchQueue.main.async { controller?.receive(message) }
+        }
+        client.onDisconnect = { [weak controller] reason in
+            DispatchQueue.main.async { controller?.connectionLost(reason) }
+        }
+        controller.onConnectionLost = { [weak self, weak controller] reason in
+            guard self?.controller === controller else { return }
+            self?.controller = nil
+            self?.setStatus("已断开：\(reason)")
+        }
+        do {
+            try controller.start()
+            self.controller = controller
+            client.startReading()
+            setStatus("已连接 \(config.host):\(config.port)")
+        } catch {
+            controller.stop()
+            setStatus("启动失败：\(error.localizedDescription)")
+        }
+    }
+
+    @objc private func openConfig() {
+        do { _ = try ensureConfig(); openInTextEdit(configURL) }
+        catch { setStatus("无法打开配置：\(error.localizedDescription)") }
+    }
+
+    @objc private func openHelp() {
+        if let bundled = Bundle.main.url(forResource: "README", withExtension: "md") {
+            openInTextEdit(bundled)
+        } else {
+            NSWorkspace.shared.open(URL(string: "https://github.com/lornezhang66/macBridgeWin#readme")!)
+        }
+    }
+
+    @objc private func quit() { NSApp.terminate(nil) }
+
+    private func ensureConfig() throws -> Bool {
+        guard !FileManager.default.fileExists(atPath: configURL.path) else { return false }
+        try FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        let template = """
+        {
+          "host": "192.168.1.100",
+          "port": 24800,
+          "token": "\(token)",
+          "pcSide": "top",
+          "edgeThreshold": 2,
+          "crossingThreshold": 10,
+          "returnThreshold": 10,
+          "sensitivity": 1.0,
+          "scrollScale": 1.0
+        }
+        """
+        try template.write(to: configURL, atomically: true, encoding: .utf8)
+        return true
+    }
+
+    private func showWelcome() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "MacBridge 已安装"
+        alert.informativeText = "菜单栏中的键盘图标会显示连接状态。请先填写 Windows IP，并把同一个令牌填入 Windows 配置。"
+        alert.addButton(withTitle: "编辑配置")
+        alert.addButton(withTitle: "稍后")
+        if alert.runModal() == .alertFirstButtonReturn { openConfig() }
+    }
+
+    private func openInTextEdit(_ url: URL) {
+        let configuration = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.open([url], withApplicationAt: URL(fileURLWithPath: "/System/Applications/TextEdit.app"),
+                                configuration: configuration)
+    }
+
+    private func setStatus(_ text: String) {
+        statusLine.title = text
+        statusItem.button?.toolTip = "MacBridge — \(text)"
+    }
+
+    private func item(_ title: String, _ action: Selector, _ key: String) -> NSMenuItem {
+        let menuItem = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        menuItem.target = self
+        return menuItem
+    }
 }
 
-do {
-    let config = try loadConfig(path: configPath)
-    let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-    guard AXIsProcessTrustedWithOptions(prompt) else {
-        throw NSError(domain: "MacBridge", code: 5,
-                      userInfo: [NSLocalizedDescriptionKey: "Accessibility permission is required"])
-    }
-
-    let client = SocketClient()
-    try client.connect(host: config.host, port: config.port, token: config.token)
-    let controller = BridgeController(config: config, client: client)
-    client.onMessage = { [weak controller] message in
-        DispatchQueue.main.async { controller?.receive(message) }
-    }
-    client.onDisconnect = { [weak controller] reason in
-        DispatchQueue.main.async { controller?.connectionLost(reason) }
-    }
-    try controller.start()
-    client.startReading()
-
-    signal(SIGINT, SIG_IGN)
-    signal(SIGTERM, SIG_IGN)
-    let interrupt = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-    let terminate = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-    interrupt.setEventHandler { controller.shutdown() }
-    terminate.setEventHandler { controller.shutdown() }
-    interrupt.resume()
-    terminate.resume()
-
-    print("macbridge: connected to \(config.host):\(config.port); move through the Mac top edge")
-    CFRunLoopRun()
-    controller.shutdown()
-} catch {
-    fputs("macbridge: \(error.localizedDescription)\n", stderr)
-    exit(1)
-}
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()

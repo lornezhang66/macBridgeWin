@@ -25,11 +25,17 @@ jobs:
         run: |
           version="${RELEASE_VERSION#v}"
           bin_path="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/macbridge"
-          mkdir -p pkgroot/usr/local/bin pkgroot/usr/local/share/macbridge dist
-          cp "$bin_path" pkgroot/usr/local/bin/macbridge
+          app="pkgroot/Applications/MacBridge.app/Contents"
+          mkdir -p "$app/MacOS" "$app/Resources" pkgroot/usr/local/share/macbridge dist
+          cp "$bin_path" "$app/MacOS/MacBridge"
+          cp packaging/macos/Info.plist "$app/Info.plist"
+          plutil -replace CFBundleShortVersionString -string "$version" "$app/Info.plist"
+          plutil -replace CFBundleVersion -string "$GITHUB_RUN_NUMBER" "$app/Info.plist"
+          cp README.md "$app/Resources/README.md"
           cp packaging/macos/macbridge.example.json pkgroot/usr/local/share/macbridge/
           cp README.md pkgroot/usr/local/share/macbridge/
-          pkgbuild --root pkgroot --install-location / \
+          codesign --force --deep --sign - pkgroot/Applications/MacBridge.app
+          pkgbuild --root pkgroot --scripts packaging/macos/scripts --install-location / \
             --identifier com.macbridge.client --version "$version" \
             "dist/MacBridge-${version}-macOS-universal.pkg"
         env:

@@ -7,14 +7,9 @@ Dependency-free keyboard/mouse sharing for the topology **Windows above Mac**. P
 Download both installers from [GitHub Releases](https://github.com/lornezhang66/macBridgeWin/releases):
 
 - Windows: install `WinBridge-*-windows-x64.msi`, edit `%LocalAppData%\Programs\WinBridge\winbridge.json`, then start WinBridge from the Start menu.
-- macOS: install `MacBridge-*-macOS-universal.pkg`, copy and edit the config, then run the client:
-  ```sh
-  cp /usr/local/share/macbridge/macbridge.example.json ~/macbridge.json
-  open -e ~/macbridge.json
-  cd ~ && /usr/local/bin/macbridge
-  ```
+- macOS: install `MacBridge-*-macOS-universal.pkg`. `MacBridge.app` is installed in `/Applications`, starts automatically, and remains visible as a keyboard icon in the menu bar.
 
-Use the Windows machine's LAN IP and the same long random token in both files. The macOS package is unsigned; use **Control-click → Open** if Gatekeeper warns. Grant macbridge Accessibility access when prompted.
+From the macOS menu-bar icon, choose **编辑配置…**, enter the Windows LAN IP and copy the same long random token into both configuration files, then choose **重新连接**. Grant Accessibility access when prompted. The package is unsigned; use **Control-click → Open** if Gatekeeper warns.
 
 ## Build and test
 
@@ -46,7 +41,7 @@ Create `winbridge.json` on Windows:
 }
 ```
 
-Create `macbridge.json` on the Mac. `returnThreshold` documents the paired Windows value and should match it; Windows performs the return-edge decision.
+The installed Mac app creates `~/Library/Application Support/MacBridge/macbridge.json` automatically. Open it from the menu-bar icon. `returnThreshold` documents the paired Windows value and should match it; Windows performs the return-edge decision.
 
 ```json
 {
@@ -68,13 +63,10 @@ Create `macbridge.json` on the Mac. `returnThreshold` documents the paired Windo
    ```powershell
    dotnet run --project windows/WinBridge.csproj -c Release -- --config winbridge.json
    ```
-2. On macOS, grant the built `macbridge` executable access in **System Settings → Privacy & Security → Accessibility**. The app prompts on first launch. Then run:
-   ```sh
-   .build/release/macbridge --config macbridge.json
-   ```
+2. On macOS, open `.build/release/macbridge` for a source build, or `/Applications/MacBridge.app` for an installed build. Grant it access in **System Settings → Privacy & Security → Accessibility** when prompted.
 3. Put the pointer at the Mac display's top edge and continue pushing upward by `crossingThreshold`. At the Windows virtual-desktop bottom, continue downward by `returnThreshold` to return.
 
-Use Ctrl-C for clean shutdown. Failed authentication never enables injection. Disconnects release injected Windows keys/buttons and restore Mac cursor association and visibility.
+Use the menu-bar **退出 MacBridge** item (or Ctrl-C for a source build) for clean shutdown. Failed authentication never enables injection. Disconnects release injected Windows keys/buttons and restore Mac cursor association and visibility.
 
 ## MVP limitations
 

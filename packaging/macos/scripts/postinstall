@@ -1,0 +1,7 @@
+#!/bin/sh
+
+user="$(stat -f '%Su' /dev/console)"
+[ "$user" = "root" ] || [ "$user" = "loginwindow" ] || \
+  launchctl asuser "$(id -u "$user")" sudo -u "$user" open -a /Applications/MacBridge.app
+
+exit 0
