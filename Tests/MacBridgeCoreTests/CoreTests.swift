@@ -61,6 +61,30 @@ final class CoreTests: XCTestCase {
         XCTAssertNil(deltas.drain())
     }
 
+    func testPointerWritesCoalesceWithoutCrossingControlBoundaries() {
+        var writes = PointerWriteState()
+        let oldGeneration = writes.addMovement(dx: 2, dy: 3)
+        XCTAssertEqual(oldGeneration, 0)
+        XCTAssertNil(writes.addMovement(dx: 4, dy: 5))
+
+        let beforeClick = writes.boundary()
+        XCTAssertEqual(beforeClick.movement?.dx, 6)
+        XCTAssertEqual(beforeClick.movement?.dy, 8)
+        XCTAssertNil(writes.drain(generation: oldGeneration!))
+
+        let newGeneration = writes.addScrolling(dx: 0, dy: 7)
+        XCTAssertEqual(newGeneration, 1)
+        let afterClick = writes.drain(generation: newGeneration!)
+        XCTAssertEqual(afterClick?.scrolling?.dy, 7)
+    }
+
+    func testMacCommandMapsToWindowsControl() {
+        XCTAssertEqual(windowsModifierKey(macKeyCode: 55), "LCONTROL")
+        XCTAssertEqual(windowsModifierKey(macKeyCode: 54), "RCONTROL")
+        XCTAssertEqual(windowsModifierKey(macKeyCode: 59), "LWIN")
+        XCTAssertNil(windowsModifierKey(macKeyCode: 57))
+    }
+
     func testConfigRejectsExtremePhysicalTuning() {
         let config = MacConfig(host: "127.0.0.1", port: 24800, token: "long-token",
                                edgeThreshold: 2, crossingThreshold: 10, returnThreshold: 10,

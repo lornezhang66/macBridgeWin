@@ -185,12 +185,13 @@ internal sealed class BridgeServer(BridgeConfig config, Action<string>? report =
             {
                 using var client = await _listener.AcceptTcpClientAsync(cancellationToken);
                 client.NoDelay = true;
+                client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
                 try { await ServeAsync(client, cancellationToken); }
                 catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
                 {
                     report?.Invoke("客户端认证超时，继续等待连接");
                 }
-                catch (Exception ex) when ((ex is IOException or SocketException or InvalidDataException or JsonException) &&
+                catch (Exception ex) when ((ex is IOException or SocketException or InvalidDataException or JsonException or TimeoutException) &&
                                              !cancellationToken.IsCancellationRequested)
                 {
                     report?.Invoke($"连接中断：{ex.Message}");
@@ -220,7 +221,8 @@ internal sealed class BridgeServer(BridgeConfig config, Action<string>? report =
             await Json.WriteAsync(stream, new { type = "auth_ok" }, cancellationToken);
             report?.Invoke("Mac 已连接并通过认证");
 
-            while (await reader.ReadLineAsync(cancellationToken) is { } line)
+            while (await reader.ReadLineAsync(cancellationToken)
+                               .WaitAsync(TimeSpan.FromSeconds(8), cancellationToken) is { } line)
             {
                 try
                 {

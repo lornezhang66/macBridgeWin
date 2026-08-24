@@ -97,6 +97,7 @@ MacBridge 首次启动时会自动创建：
 3. 将鼠标移动到 Mac 屏幕顶部，然后继续向上推动超过阈值。
 4. 鼠标将从 Windows 虚拟桌面底部对应的横向位置进入。
 5. 返回时，将鼠标移动到 Windows 虚拟桌面底部，然后继续向下推动超过阈值。
+6. 控制 Windows 时，Mac 的 `Command+C/V/X/A/Z` 会映射为 Windows 的 `Ctrl+C/V/X/A/Z`。
 
 如果连接失败：
 
@@ -128,6 +129,7 @@ dotnet build windows/WinBridge.csproj -c Release
 - 连接断开时，Windows 会释放已按下的按键和鼠标按钮。
 - 连接断开或系统持续禁用输入捕获时，Mac 会自动恢复本机鼠标和键盘控制。
 - Mac 在控制 Windows 时出现通知或其他应用切换焦点，MacBridge 会重新确认 HID 捕获并继续转发输入。
+- Mac 锁屏、睡眠或网络短暂中断后会自动断开旧会话并重连；Windows 会清理失活连接。
 - 当前 TCP 连接只进行令牌认证，不加密通信。请仅在可信局域网中使用，或通过安全隧道连接。
 
 ## 当前限制

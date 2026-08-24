@@ -126,6 +126,11 @@ public func sanitizedDelta(_ value: Double, scale: Double, limit: Double = 1_000
     return min(limit, max(-limit, value * scale))
 }
 
+public func windowsModifierKey(macKeyCode code: Int64) -> String? {
+    [54: "RCONTROL", 55: "LCONTROL", 56: "LSHIFT", 58: "LALT",
+     59: "LWIN", 60: "RSHIFT", 61: "RALT", 62: "RWIN"][code]
+}
+
 public struct DeltaAccumulator {
     public private(set) var dx: Double = 0
     public private(set) var dy: Double = 0
@@ -144,6 +149,49 @@ public struct DeltaAccumulator {
     }
 
     public mutating func reset() { dx = 0; dy = 0 }
+}
+
+public struct PointerBatch {
+    public let movement: (dx: Double, dy: Double)?
+    public let scrolling: (dx: Double, dy: Double)?
+}
+
+public struct PointerWriteState {
+    public private(set) var generation = 0
+    private var movement = DeltaAccumulator()
+    private var scrolling = DeltaAccumulator()
+    private var scheduled = false
+
+    public init() {}
+
+    public mutating func addMovement(dx: Double, dy: Double) -> Int? {
+        movement.add(dx: dx, dy: dy)
+        return schedule()
+    }
+
+    public mutating func addScrolling(dx: Double, dy: Double) -> Int? {
+        scrolling.add(dx: dx, dy: dy)
+        return schedule()
+    }
+
+    public mutating func boundary() -> PointerBatch {
+        defer { generation += 1; scheduled = false }
+        return PointerBatch(movement: movement.drain(), scrolling: scrolling.drain())
+    }
+
+    public mutating func drain(generation expected: Int) -> PointerBatch? {
+        guard scheduled, expected == generation else { return nil }
+        scheduled = false
+        return PointerBatch(movement: movement.drain(), scrolling: scrolling.drain())
+    }
+
+    public mutating func reset() { _ = boundary() }
+
+    private mutating func schedule() -> Int? {
+        guard !scheduled else { return nil }
+        scheduled = true
+        return generation
+    }
 }
 
 public struct WireMessage: Codable, Equatable {

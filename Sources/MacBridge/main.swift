@@ -13,6 +13,7 @@ final class SocketClient {
     private var receiveBuffer = [UInt8](repeating: 0, count: 8_192)
     private var receiveOffset = 0
     private var receiveCount = 0
+    private var pointerWrites = PointerWriteState()
     private var stopped = false
     var onMessage: ((WireMessage) -> Void)?
     var onDisconnect: ((String) -> Void)?
@@ -38,6 +39,10 @@ final class SocketClient {
                 var timeout = timeval(tv_sec: 1, tv_usec: 0)
                 setsockopt(candidate, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout.size(ofValue: one)))
                 setsockopt(candidate, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout.size(ofValue: timeout)))
+                setsockopt(candidate, SOL_SOCKET, SO_KEEPALIVE, &one, socklen_t(MemoryLayout.size(ofValue: one)))
+                var keepalive: Int32 = 3
+                setsockopt(candidate, IPPROTO_TCP, TCP_KEEPALIVE, &keepalive,
+                           socklen_t(MemoryLayout.size(ofValue: keepalive)))
                 setsockopt(candidate, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout.size(ofValue: one)))
                 if connectWithTimeout(candidate, address: address.pointee.ai_addr,
                                       length: address.pointee.ai_addrlen) {
@@ -59,7 +64,7 @@ final class SocketClient {
         stopped = false
         stateLock.unlock()
         guard sendBlocking(WireMessage(type: "auth", token: token)),
-              let line = readLine(maxBytes: 65_536),
+              let line = readLine(maxBytes: 65_536, timeoutMilliseconds: 5_000),
               let reply = try? JSONDecoder().decode(WireMessage.self, from: line),
               reply.type == "auth_ok" else {
             close()
@@ -97,12 +102,47 @@ final class SocketClient {
     @discardableResult func send(_ message: WireMessage) -> Bool {
         stateLock.lock()
         let connected = !stopped && fd >= 0
+        let isPointer = message.type == "move" || message.type == "scroll"
+        var generation: Int?
+        if connected, message.type == "move", let dx = message.dx, let dy = message.dy {
+            generation = pointerWrites.addMovement(dx: dx, dy: dy)
+        } else if connected, message.type == "scroll", let dx = message.dx, let dy = message.dy {
+            generation = pointerWrites.addScrolling(dx: dx, dy: dy)
+        }
+        let boundary = connected && !isPointer ? pointerWrites.boundary() : nil
         stateLock.unlock()
         guard connected else { return false }
-        writerQueue.async { [weak self] in
-            guard let self, !self.sendBlocking(message) else { return }
-            self.finish(reason: "向 Windows 发送数据失败")
+        if let generation {
+            writerQueue.async { [weak self] in self?.sendPendingPointer(generation: generation) }
+        } else if !isPointer {
+            writerQueue.async { [weak self] in
+                guard let self else { return }
+                guard self.writePointer(movement: boundary?.movement, scrolling: boundary?.scrolling),
+                      self.sendBlocking(message) else {
+                    self.finish(reason: "向 Windows 发送数据失败")
+                    return
+                }
+            }
         }
+        return true
+    }
+
+    private func sendPendingPointer(generation: Int) {
+        stateLock.lock()
+        let batch = pointerWrites.drain(generation: generation)
+        stateLock.unlock()
+        guard let batch else { return }
+        if !writePointer(movement: batch.movement, scrolling: batch.scrolling) {
+            finish(reason: "向 Windows 发送数据失败")
+        }
+    }
+
+    private func writePointer(movement: (dx: Double, dy: Double)?,
+                              scrolling: (dx: Double, dy: Double)?) -> Bool {
+        if let movement,
+           !sendBlocking(WireMessage(type: "move", dx: movement.dx, dy: movement.dy)) { return false }
+        if let scrolling,
+           !sendBlocking(WireMessage(type: "scroll", dx: scrolling.dx, dy: scrolling.dy)) { return false }
         return true
     }
 
@@ -124,7 +164,7 @@ final class SocketClient {
         }
     }
 
-    private func readLine(maxBytes: Int) -> Data? {
+    private func readLine(maxBytes: Int, timeoutMilliseconds: Int32? = nil) -> Data? {
         var line = Data()
         while true {
             if receiveOffset < receiveCount {
@@ -140,6 +180,13 @@ final class SocketClient {
             }
 
             guard let socket = beginIO() else { return nil }
+            if let timeoutMilliseconds {
+                var descriptor = pollfd(fd: socket, events: Int16(POLLIN), revents: 0)
+                if poll(&descriptor, 1, timeoutMilliseconds) <= 0 {
+                    endIO()
+                    return nil
+                }
+            }
             let received = receiveBuffer.withUnsafeMutableBytes { bytes in
                 Darwin.recv(socket, bytes.baseAddress, bytes.count, 0)
             }
@@ -171,6 +218,7 @@ final class SocketClient {
         stateLock.lock()
         let shouldNotify = !stopped
         stopped = true
+        pointerWrites.reset()
         let socket = fd
         fd = -1
         if socket >= 0 { Darwin.shutdown(socket, SHUT_RDWR) }
@@ -202,6 +250,7 @@ final class BridgeController {
     private var savedScreen = CGRect.zero
     private var savedDisplay = CGMainDisplayID()
     private var cursorHideDepth = 0
+    private var lastHeartbeat: TimeInterval = 0
     private var shuttingDown = false
     var onConnectionLost: ((String) -> Void)?
 
@@ -318,16 +367,23 @@ final class BridgeController {
     }
 
     private func enterPC(at point: CGPoint, screen: (id: CGDirectDisplayID, bounds: CGRect)) {
-        guard state.enterPC() else { return }
+        guard state.mode == .macActive else { return }
         savedDisplay = screen.id
         savedScreen = screen.bounds
+        guard setCursorAssociation(associated: false) else {
+            crossing.reset()
+            return
+        }
+        guard hideMacCursor(), state.enterPC() else {
+            _ = setCursorAssociation(associated: true)
+            _ = restoreMacCursorVisibility()
+            return
+        }
         let ratio = clampedRatio(position: point.x, origin: screen.bounds.minX, length: screen.bounds.width)
         movement.reset()
         scrolling.reset()
         resynchronizeModifiers(forward: false)
         forwardedModifierCodes.removeAll()
-        CGAssociateMouseAndMouseCursorPosition(boolean_t(0))
-        hideMacCursor()
         if client.send(WireMessage(type: "enter_pc", xRatio: ratio)) {
             forwardCurrentModifiers()
         } else {
@@ -336,13 +392,16 @@ final class BridgeController {
     }
 
     private func restoreMac(ratio: Double) {
-        guard state.returnToMac() else { return }
+        guard state.mode == .pcActive else { return }
+        guard setCursorAssociation(associated: true), restoreMacCursorVisibility() else {
+            connectionLost("无法恢复 Mac 鼠标")
+            return
+        }
+        _ = state.returnToMac()
         crossing.reset()
         movement.reset()
         scrolling.reset()
         forwardedModifierCodes.removeAll()
-        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-        restoreMacCursorVisibility()
         let x = clampedPosition(ratio: ratio, origin: savedScreen.minX, length: savedScreen.width)
         CGWarpMouseCursorPosition(CGPoint(x: x, y: savedScreen.minY + 2))
     }
@@ -353,8 +412,8 @@ final class BridgeController {
         movement.reset()
         scrolling.reset()
         forwardedModifierCodes.removeAll()
-        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-        restoreMacCursorVisibility()
+        _ = setCursorAssociation(associated: true)
+        _ = restoreMacCursorVisibility()
     }
 
     private func startTimers() {
@@ -388,6 +447,11 @@ final class BridgeController {
 
     private func monitorCapture() {
         guard !shuttingDown, let tap else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if now < lastHeartbeat || now - lastHeartbeat >= 2 {
+            lastHeartbeat = now
+            send(WireMessage(type: "ping"))
+        }
         if !CGEvent.tapIsEnabled(tap: tap) {
             CGEvent.tapEnable(tap: tap, enable: true)
             if !CGEvent.tapIsEnabled(tap: tap) {
@@ -397,8 +461,22 @@ final class BridgeController {
             }
             if state.mode == .pcActive {
                 resynchronizeModifiers(forward: true)
-                hideMacCursor()
+                if !hideMacCursor() {
+                    tapRecoveryFailures += 1
+                    if tapRecoveryFailures >= 3 { connectionLost("无法隐藏 Mac 鼠标") }
+                    return
+                }
             }
+        }
+        if state.mode == .pcActive, cursorHideDepth == 0, !hideMacCursor() {
+            tapRecoveryFailures += 1
+            if tapRecoveryFailures >= 3 { connectionLost("无法隐藏 Mac 鼠标") }
+            return
+        }
+        if state.mode == .pcActive, !setCursorAssociation(associated: false) {
+            tapRecoveryFailures += 1
+            if tapRecoveryFailures >= 3 { connectionLost("无法锁定 Mac 鼠标") }
+            return
         }
         tapRecoveryFailures = 0
     }
@@ -410,19 +488,30 @@ final class BridgeController {
             guard CGEvent.tapIsEnabled(tap: tap) else { return }
         }
         resynchronizeModifiers(forward: true)
-        CGAssociateMouseAndMouseCursorPosition(boolean_t(0))
-        hideMacCursor()
+        guard setCursorAssociation(associated: false), hideMacCursor() else { return }
     }
 
-    private func hideMacCursor() {
-        if CGDisplayHideCursor(savedDisplay) == .success { cursorHideDepth += 1 }
+    private func setCursorAssociation(associated: Bool) -> Bool {
+        for _ in 0..<3 where CGAssociateMouseAndMouseCursorPosition(boolean_t(associated ? 1 : 0)) == .success {
+            return true
+        }
+        return false
     }
 
-    private func restoreMacCursorVisibility() {
+    @discardableResult private func hideMacCursor() -> Bool {
+        guard CGDisplayHideCursor(savedDisplay) == .success else { return false }
+        cursorHideDepth += 1
+        return true
+    }
+
+    @discardableResult private func restoreMacCursorVisibility() -> Bool {
         while cursorHideDepth > 0 {
-            CGDisplayShowCursor(savedDisplay)
+            var result = CGDisplayShowCursor(savedDisplay)
+            if result != .success { result = CGDisplayShowCursor(CGMainDisplayID()) }
+            guard result == .success else { return false }
             cursorHideDepth -= 1
         }
+        return true
     }
 
     private func send(_ message: WireMessage) {
@@ -511,6 +600,7 @@ private func modifierNames(_ flags: CGEventFlags) -> [String] {
 }
 
 private func keyName(code: Int64) -> String? {
+    if let modifier = windowsModifierKey(macKeyCode: code) { return modifier }
     let keys: [Int64: String] = [
         0:"A", 1:"S", 2:"D", 3:"F", 4:"H", 5:"G", 6:"Z", 7:"X", 8:"C", 9:"V",
         11:"B", 12:"Q", 13:"W", 14:"E", 15:"R", 16:"Y", 17:"T", 18:"1", 19:"2",
@@ -518,8 +608,7 @@ private func keyName(code: Int64) -> String? {
         29:"0", 30:"]", 31:"O", 32:"U", 33:"[", 34:"I", 35:"P", 36:"ENTER",
         37:"L", 38:"J", 39:"'", 40:"K", 41:";", 42:"\\", 43:",", 44:"/", 45:"N",
         46:"M", 47:".", 48:"TAB", 49:"SPACE", 50:"`", 51:"BACKSPACE", 53:"ESCAPE",
-        54:"RWIN", 55:"LWIN", 56:"LSHIFT", 57:"CAPSLOCK", 58:"LALT", 59:"LCONTROL",
-        60:"RSHIFT", 61:"RALT", 62:"RCONTROL", 64:"F17", 65:"DECIMAL", 67:"MULTIPLY",
+        57:"CAPSLOCK", 64:"F17", 65:"DECIMAL", 67:"MULTIPLY",
         69:"ADD", 71:"NUMLOCK", 75:"DIVIDE", 76:"NUMENTER", 78:"SUBTRACT", 79:"F18",
         80:"F19", 81:"NUM=", 82:"NUM0", 83:"NUM1", 84:"NUM2", 85:"NUM3", 86:"NUM4",
         87:"NUM5", 88:"NUM6", 89:"NUM7", 91:"NUM8", 92:"NUM9", 96:"F5", 97:"F6",
@@ -543,6 +632,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusLine = NSMenuItem(title: "正在启动…", action: nil, keyEquivalent: "")
     private var controller: BridgeController?
     private var connectAttempt = UUID()
+    private var retryTimer: Timer?
+    private var sessionActive = true
 
     private var configURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -564,10 +655,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(item("退出 MacBridge", #selector(quit), "q"))
         statusItem.menu = menu
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(workspaceFocusChanged),
-            name: NSWorkspace.didActivateApplicationNotification, object: nil
-        )
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.addObserver(self, selector: #selector(workspaceFocusChanged),
+                              name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(sessionResigned),
+                              name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(sessionBecameActive),
+                              name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(systemWillSleep),
+                              name: NSWorkspace.willSleepNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(systemWillSleep),
+                              name: NSWorkspace.screensDidSleepNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(systemDidWake),
+                              name: NSWorkspace.didWakeNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(systemDidWake),
+                              name: NSWorkspace.screensDidWakeNotification, object: nil)
 
         do {
             if try ensureConfig() { showWelcome() }
@@ -579,13 +681,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        retryTimer?.invalidate()
         connectAttempt = UUID()
         controller?.stop()
     }
 
     @objc private func workspaceFocusChanged(_ notification: Notification) { controller?.reassertCapture() }
 
+    @objc private func sessionResigned(_ notification: Notification) {
+        sessionActive = false
+        disconnectForPause("会话已锁定")
+    }
+
+    @objc private func sessionBecameActive(_ notification: Notification) {
+        sessionActive = true
+        reconnect()
+    }
+
+    @objc private func systemWillSleep(_ notification: Notification) { disconnectForPause("系统正在睡眠") }
+
+    @objc private func systemDidWake(_ notification: Notification) {
+        if sessionActive { reconnect() }
+    }
+
+    private func disconnectForPause(_ status: String) {
+        retryTimer?.invalidate()
+        retryTimer = nil
+        connectAttempt = UUID()
+        controller?.stop()
+        controller = nil
+        setStatus(status)
+    }
+
     @objc private func reconnect() {
+        guard sessionActive else { return }
+        retryTimer?.invalidate()
+        retryTimer = nil
         connectAttempt = UUID()
         controller?.stop()
         controller = nil
@@ -620,8 +751,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async {
                     guard let self, self.connectAttempt == attempt else { return }
                     self.setStatus("连接失败：\(error.localizedDescription)")
+                    self.scheduleReconnect()
                 }
             }
+        }
+    }
+
+    private func scheduleReconnect() {
+        guard sessionActive, retryTimer == nil else { return }
+        retryTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in
+            self?.reconnect()
         }
     }
 
@@ -636,7 +775,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onConnectionLost = { [weak self, weak controller] reason in
             guard self?.controller === controller else { return }
             self?.controller = nil
-            self?.setStatus("已断开：\(reason)")
+            self?.setStatus("已断开：\(reason)，正在重连…")
+            self?.scheduleReconnect()
         }
         do {
             try controller.start()
