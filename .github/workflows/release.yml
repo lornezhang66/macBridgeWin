@@ -60,7 +60,7 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:RELEASE_VERSION.TrimStart('v')
-          dotnet tool install --global wix
+          dotnet tool install --global wix --version 4.0.6
           New-Item -ItemType Directory -Force dist | Out-Null
           wix build packaging/windows/Package.wxs -arch x64 `
             -d "Version=$version" -d "Payload=$((Resolve-Path payload).Path)" `
