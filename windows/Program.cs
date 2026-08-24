@@ -1,38 +1,28 @@
+using System.Diagnostics;
+using System.Drawing;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Windows.Forms;
 
 internal static class Program
 {
-    public static async Task<int> Main(string[] args)
+    [STAThread]
+    public static int Main(string[] args)
     {
         if (args.Contains("--self-test")) return SelfTests.Run();
-        if (!OperatingSystem.IsWindows())
-        {
-            Console.Error.WriteLine("winbridge: Windows is required (self-tests can run anywhere)");
-            return 1;
-        }
+        if (!OperatingSystem.IsWindows()) return 1;
 
-        var path = ValueAfter(args, "--config") ?? "winbridge.json";
-        try
-        {
-            var config = JsonSerializer.Deserialize<BridgeConfig>(await File.ReadAllTextAsync(path), Json.Options)
-                         ?? throw new InvalidDataException("empty config");
-            config.Validate();
-            using var shutdown = new CancellationTokenSource();
-            Console.CancelKeyPress += (_, e) => { e.Cancel = true; shutdown.Cancel(); };
-            await new BridgeServer(config).RunAsync(shutdown.Token);
-            return 0;
-        }
-        catch (OperationCanceledException) { return 0; }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"winbridge: {ex.Message}");
-            return 1;
-        }
+        using var singleInstance = new Mutex(true, "Local\\MacBridge.WinBridge", out var created);
+        if (!created) return 0;
+
+        var path = ValueAfter(args, "--config") ?? Path.Combine(AppContext.BaseDirectory, "winbridge.json");
+        ApplicationConfiguration.Initialize();
+        Application.Run(new TrayContext(path));
+        return 0;
     }
 
     private static string? ValueAfter(string[] args, string name)
@@ -40,6 +30,102 @@ internal static class Program
         var index = Array.IndexOf(args, name);
         return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
     }
+}
+
+internal sealed class TrayContext : ApplicationContext
+{
+    private readonly string _configPath;
+    private readonly NotifyIcon _icon;
+    private readonly ToolStripMenuItem _status = new("正在启动…") { Enabled = false };
+    private CancellationTokenSource? _serverStop;
+    private Task? _serverTask;
+    private bool _firstStart = true;
+
+    public TrayContext(string configPath)
+    {
+        _configPath = configPath;
+        var menu = new ContextMenuStrip();
+        menu.Items.Add(_status);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("重新启动服务", null, (_, _) => StartServer());
+        menu.Items.Add("编辑配置…", null, (_, _) => OpenConfig());
+        menu.Items.Add("打开安装目录…", null, (_, _) => OpenInstallFolder());
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("退出 WinBridge", null, (_, _) => ExitThread());
+
+        _icon = new NotifyIcon
+        {
+            Icon = SystemIcons.Application,
+            Text = "WinBridge",
+            ContextMenuStrip = menu,
+            Visible = true
+        };
+        _icon.DoubleClick += (_, _) => OpenConfig();
+        StartServer();
+    }
+
+    protected override void ExitThreadCore()
+    {
+        _serverStop?.Cancel();
+        _icon.Visible = false;
+        _icon.Dispose();
+        base.ExitThreadCore();
+    }
+
+    private async void StartServer()
+    {
+        _serverStop?.Cancel();
+        if (_serverTask is not null)
+        {
+            try { await _serverTask; }
+            catch (OperationCanceledException) { }
+            catch { }
+        }
+        _serverStop?.Dispose();
+        _serverStop = new CancellationTokenSource();
+
+        try
+        {
+            var config = JsonSerializer.Deserialize<BridgeConfig>(await File.ReadAllTextAsync(_configPath), Json.Options)
+                         ?? throw new InvalidDataException("配置为空");
+            config.Validate();
+            SetStatus($"正在监听 {config.ListenHost}:{config.Port}");
+            _serverTask = new BridgeServer(config, SetStatus).RunAsync(_serverStop.Token);
+            await _serverTask;
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            SetStatus($"未运行：{ex.Message}");
+            if (_firstStart)
+            {
+                _icon.ShowBalloonTip(8000, "WinBridge 需要配置",
+                    "双击托盘图标填写令牌，然后选择“重新启动服务”。", ToolTipIcon.Info);
+                OpenConfig();
+            }
+        }
+        finally { _firstStart = false; }
+    }
+
+    private void SetStatus(string text)
+    {
+        if (_status.Owner?.InvokeRequired == true)
+        {
+            _status.Owner.BeginInvoke(new Action(() => SetStatus(text)));
+            return;
+        }
+        _status.Text = text;
+        _icon.Text = text.Length <= 63 ? text : text[..63];
+    }
+
+    private void OpenConfig()
+    {
+        if (!File.Exists(_configPath)) File.WriteAllText(_configPath, "{}\n");
+        Process.Start(new ProcessStartInfo("notepad.exe", $"\"{_configPath}\"") { UseShellExecute = true });
+    }
+
+    private static void OpenInstallFolder() =>
+        Process.Start(new ProcessStartInfo("explorer.exe", $"\"{AppContext.BaseDirectory}\"") { UseShellExecute = true });
 }
 
 internal sealed record BridgeConfig
@@ -59,14 +145,14 @@ internal sealed record BridgeConfig
     }
 }
 
-internal sealed class BridgeServer(BridgeConfig config)
+internal sealed class BridgeServer(BridgeConfig config, Action<string>? report = null)
 {
     private readonly TcpListener _listener = new(IPAddress.Parse(config.ListenHost), config.Port);
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         _listener.Start();
-        Console.WriteLine($"winbridge: listening on {config.ListenHost}:{config.Port}");
+        report?.Invoke($"正在监听 {config.ListenHost}:{config.Port}");
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -76,7 +162,7 @@ internal sealed class BridgeServer(BridgeConfig config)
                 try { await ServeAsync(client, cancellationToken); }
                 catch (Exception ex) when ((ex is IOException or SocketException) && !cancellationToken.IsCancellationRequested)
                 {
-                    Console.WriteLine($"winbridge: client connection ended: {ex.Message}");
+                    report?.Invoke($"连接中断：{ex.Message}");
                 }
             }
         }
@@ -87,7 +173,7 @@ internal sealed class BridgeServer(BridgeConfig config)
     {
         var input = new WindowsInput(config);
         var stream = client.GetStream();
-        Console.WriteLine($"winbridge: connection from {client.Client.RemoteEndPoint}");
+        report?.Invoke($"Mac 已连接：{client.Client.RemoteEndPoint}");
         try
         {
             using var authTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -96,11 +182,11 @@ internal sealed class BridgeServer(BridgeConfig config)
             if (authLine is null || !Protocol.Authenticates(authLine, config.Token))
             {
                 await Json.WriteAsync(stream, new { type = "auth_failed" }, cancellationToken);
-                Console.WriteLine("winbridge: authentication failed");
+                report?.Invoke("认证失败");
                 return;
             }
             await Json.WriteAsync(stream, new { type = "auth_ok" }, cancellationToken);
-            Console.WriteLine("winbridge: authenticated");
+            report?.Invoke("Mac 已连接并通过认证");
 
             while (await Json.ReadLineAsync(stream, cancellationToken) is { } line)
             {
@@ -116,7 +202,7 @@ internal sealed class BridgeServer(BridgeConfig config)
         finally
         {
             input.ReleaseAll();
-            Console.WriteLine("winbridge: client disconnected; released captured input");
+            report?.Invoke("Mac 已断开，等待连接");
         }
     }
 }

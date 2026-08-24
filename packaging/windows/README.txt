@@ -1,8 +1,9 @@
 WinBridge quick setup
 
-1. Edit winbridge.json in this folder. Replace change-me with a long random token.
-2. Allow WinBridge through Windows Firewall on Private networks when prompted.
-3. Start WinBridge from the Start menu.
-4. Put the Windows IP and the same token in the Mac configuration.
+1. Find the WinBridge icon in the Windows system tray.
+2. Right-click it and choose "编辑配置…". Replace change-me with a long random token.
+3. Put the Windows IP and the same token in the Mac configuration.
+4. Right-click the tray icon and choose "重新启动服务".
+5. Allow WinBridge through Windows Firewall on Private networks when prompted.
 
-The window must remain open while sharing input. Press Ctrl+C or close it to stop.
+WinBridge starts after installation and at sign-in. Use the tray menu to see status or quit.

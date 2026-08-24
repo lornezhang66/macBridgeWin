@@ -19,15 +19,25 @@
           <Component Id="WinBridgeReadme" Guid="*">
             <File Id="WinBridgeReadmeFile" Source="$(var.Payload)\README.txt" KeyPath="yes" />
           </Component>
+          <Component Id="WinBridgeAutoStart" Guid="*">
+            <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                           Name="WinBridge" Value="&quot;[#WinBridgeExe]&quot;" Type="string" KeyPath="yes" />
+          </Component>
         </Directory>
       </Directory>
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder" />
+    <CustomAction Id="LaunchWinBridge" FileRef="WinBridgeExe" Execute="immediate"
+                  Return="asyncNoWait" Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="LaunchWinBridge" After="InstallFinalize" Condition="NOT Installed" />
+    </InstallExecuteSequence>
     <Feature Id="MainFeature" Title="WinBridge">
       <ComponentRef Id="WinBridgeExecutable" />
       <ComponentRef Id="WinBridgeConfig" />
       <ComponentRef Id="WinBridgeReadme" />
+      <ComponentRef Id="WinBridgeAutoStart" />
     </Feature>
   </Package>
 </Wix>

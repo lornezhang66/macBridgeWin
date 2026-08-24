@@ -6,7 +6,7 @@ Dependency-free keyboard/mouse sharing for the topology **Windows above Mac**. P
 
 Download both installers from [GitHub Releases](https://github.com/lornezhang66/macBridgeWin/releases):
 
-- Windows: install `WinBridge-*-windows-x64.msi`, edit `%LocalAppData%\Programs\WinBridge\winbridge.json`, then start WinBridge from the Start menu.
+- Windows: install `WinBridge-*-windows-x64.msi`. WinBridge starts automatically and remains in the system tray. Double-click the tray icon to edit `%LocalAppData%\Programs\WinBridge\winbridge.json`, then choose **重新启动服务** from its right-click menu.
 - macOS: install `MacBridge-*-macOS-universal.pkg`. `MacBridge.app` is installed in `/Applications`, starts automatically, and remains visible as a keyboard icon in the menu bar.
 
 From the macOS menu-bar icon, choose **编辑配置…**, enter the Windows LAN IP and copy the same long random token into both configuration files, then choose **重新连接**. Grant Accessibility access when prompted. The package is unsigned; use **Control-click → Open** if Gatekeeper warns.
@@ -59,7 +59,7 @@ The installed Mac app creates `~/Library/Application Support/MacBridge/macbridge
 
 ## Run
 
-1. On Windows, allow inbound TCP port `24800` on the **Private** firewall profile, then start the listener:
+1. On Windows, allow inbound TCP port `24800` on the **Private** firewall profile. The installed app starts from the system tray; a source build can be started with:
    ```powershell
    dotnet run --project windows/WinBridge.csproj -c Release -- --config winbridge.json
    ```
