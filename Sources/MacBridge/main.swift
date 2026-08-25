@@ -5,6 +5,11 @@ import Darwin
 import Foundation
 import MacBridgeCore
 
+@_silgen_name("_CGSDefaultConnection") private func CGSDefaultConnection() -> Int32
+@_silgen_name("CGSSetConnectionProperty") private func CGSSetConnectionProperty(
+    _ connection: Int32, _ target: Int32, _ key: CFString, _ value: CFTypeRef
+) -> CGError
+
 final class SocketClient {
     private var fd: Int32 = -1
     private let writerQueue = DispatchQueue(label: "com.macbridge.socket-writer", qos: .userInteractive)
@@ -249,7 +254,6 @@ final class BridgeController {
     private var tapRecoveryFailures = 0
     private var savedScreen = CGRect.zero
     private var savedDisplay = CGMainDisplayID()
-    private var previousApplication: NSRunningApplication?
     private var cursorHideDepth = 0
     private var lastHeartbeat: TimeInterval = 0
     private var shuttingDown = false
@@ -290,7 +294,8 @@ final class BridgeController {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             if state.mode == .pcActive {
                 resynchronizeModifiers(forward: true)
-                hideMacCursor()
+                if cursorHideDepth == 0 { _ = hideMacCursor() }
+                _ = setCursorAssociation(associated: false)
             }
             return nil
         }
@@ -371,17 +376,9 @@ final class BridgeController {
         guard state.mode == .macActive else { return }
         savedDisplay = screen.id
         savedScreen = screen.bounds
-        previousApplication = NSWorkspace.shared.frontmostApplication
-        NSApp.activate(ignoringOtherApps: true)
-        guard setCursorAssociation(associated: false) else {
+        guard hideMacCursor(), setCursorAssociation(associated: false), state.enterPC() else {
             crossing.reset()
-            restorePreviousApplication()
-            return
-        }
-        guard hideMacCursor(), state.enterPC() else {
-            _ = setCursorAssociation(associated: true)
             _ = restoreMacCursorVisibility()
-            restorePreviousApplication()
             return
         }
         let ratio = clampedRatio(position: point.x, origin: screen.bounds.minX, length: screen.bounds.width)
@@ -398,7 +395,7 @@ final class BridgeController {
 
     private func restoreMac(ratio: Double) {
         guard state.mode == .pcActive else { return }
-        guard setCursorAssociation(associated: true), restoreMacCursorVisibility() else {
+        guard restoreMacCursorVisibility(), setCursorAssociation(associated: true) else {
             connectionLost("无法恢复 Mac 鼠标")
             return
         }
@@ -409,7 +406,6 @@ final class BridgeController {
         forwardedModifierCodes.removeAll()
         let x = clampedPosition(ratio: ratio, origin: savedScreen.minX, length: savedScreen.width)
         CGWarpMouseCursorPosition(CGPoint(x: x, y: savedScreen.minY + 2))
-        restorePreviousApplication()
     }
 
     private func safetyRestore() {
@@ -418,9 +414,8 @@ final class BridgeController {
         movement.reset()
         scrolling.reset()
         forwardedModifierCodes.removeAll()
-        _ = setCursorAssociation(associated: true)
         _ = restoreMacCursorVisibility()
-        restorePreviousApplication()
+        _ = setCursorAssociation(associated: true)
     }
 
     private func startTimers() {
@@ -468,7 +463,7 @@ final class BridgeController {
             }
             if state.mode == .pcActive {
                 resynchronizeModifiers(forward: true)
-                if !hideMacCursor() {
+                if cursorHideDepth == 0, !hideMacCursor() {
                     tapRecoveryFailures += 1
                     if tapRecoveryFailures >= 3 { connectionLost("无法隐藏 Mac 鼠标") }
                     return
@@ -495,13 +490,8 @@ final class BridgeController {
             guard CGEvent.tapIsEnabled(tap: tap) else { return }
         }
         resynchronizeModifiers(forward: true)
-        guard setCursorAssociation(associated: false) else { return }
-        if cursorHideDepth == 0 { _ = hideMacCursor() }
-    }
-
-    private func restorePreviousApplication() {
-        previousApplication?.activate(options: [])
-        previousApplication = nil
+        if cursorHideDepth == 0, !hideMacCursor() { return }
+        _ = setCursorAssociation(associated: false)
     }
 
     private func setCursorAssociation(associated: Bool) -> Bool {
@@ -511,13 +501,22 @@ final class BridgeController {
         return false
     }
 
+    @discardableResult private func enableBackgroundCursorControl() -> Bool {
+        // ponytail: WindowServer has no public background-cursor API; replace when Apple adds one.
+        let connection = CGSDefaultConnection()
+        return CGSSetConnectionProperty(connection, connection,
+                                         "SetsCursorInBackground" as CFString, kCFBooleanTrue) == .success
+    }
+
     @discardableResult private func hideMacCursor() -> Bool {
-        guard CGDisplayHideCursor(savedDisplay) == .success else { return false }
+        guard enableBackgroundCursorControl(), CGDisplayHideCursor(savedDisplay) == .success else { return false }
         cursorHideDepth += 1
+        _ = setCursorAssociation(associated: true)
         return true
     }
 
     @discardableResult private func restoreMacCursorVisibility() -> Bool {
+        _ = enableBackgroundCursorControl()
         while cursorHideDepth > 0 {
             var result = CGDisplayShowCursor(savedDisplay)
             if result != .success { result = CGDisplayShowCursor(CGMainDisplayID()) }
