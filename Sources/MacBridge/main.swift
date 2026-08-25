@@ -734,6 +734,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setStatus("需要开启“辅助功能”权限")
             return
         }
+        guard CGPreflightListenEventAccess() || CGRequestListenEventAccess() else {
+            setStatus("需要开启“输入监控”权限，授权后请重新连接")
+            return
+        }
 
         let attempt = connectAttempt
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
