@@ -249,6 +249,7 @@ final class BridgeController {
     private var tapRecoveryFailures = 0
     private var savedScreen = CGRect.zero
     private var savedDisplay = CGMainDisplayID()
+    private var previousApplication: NSRunningApplication?
     private var cursorHideDepth = 0
     private var lastHeartbeat: TimeInterval = 0
     private var shuttingDown = false
@@ -370,13 +371,17 @@ final class BridgeController {
         guard state.mode == .macActive else { return }
         savedDisplay = screen.id
         savedScreen = screen.bounds
+        previousApplication = NSWorkspace.shared.frontmostApplication
+        NSApp.activate(ignoringOtherApps: true)
         guard setCursorAssociation(associated: false) else {
             crossing.reset()
+            restorePreviousApplication()
             return
         }
         guard hideMacCursor(), state.enterPC() else {
             _ = setCursorAssociation(associated: true)
             _ = restoreMacCursorVisibility()
+            restorePreviousApplication()
             return
         }
         let ratio = clampedRatio(position: point.x, origin: screen.bounds.minX, length: screen.bounds.width)
@@ -404,6 +409,7 @@ final class BridgeController {
         forwardedModifierCodes.removeAll()
         let x = clampedPosition(ratio: ratio, origin: savedScreen.minX, length: savedScreen.width)
         CGWarpMouseCursorPosition(CGPoint(x: x, y: savedScreen.minY + 2))
+        restorePreviousApplication()
     }
 
     private func safetyRestore() {
@@ -414,6 +420,7 @@ final class BridgeController {
         forwardedModifierCodes.removeAll()
         _ = setCursorAssociation(associated: true)
         _ = restoreMacCursorVisibility()
+        restorePreviousApplication()
     }
 
     private func startTimers() {
@@ -488,7 +495,13 @@ final class BridgeController {
             guard CGEvent.tapIsEnabled(tap: tap) else { return }
         }
         resynchronizeModifiers(forward: true)
-        guard setCursorAssociation(associated: false), hideMacCursor() else { return }
+        guard setCursorAssociation(associated: false) else { return }
+        if cursorHideDepth == 0 { _ = hideMacCursor() }
+    }
+
+    private func restorePreviousApplication() {
+        previousApplication?.activate(options: [])
+        previousApplication = nil
     }
 
     private func setCursorAssociation(associated: Bool) -> Bool {
